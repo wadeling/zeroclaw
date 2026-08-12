@@ -1474,12 +1474,12 @@ impl Channel for MsTeamsChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
-        // Tool-call envelopes reach this method on paths the orchestrator's
-        // outbound sanitizing never touched: a `multi_message` paragraph is
-        // published from the streamed text, which only has `<think>` blocks
-        // removed. Stripping here rather than per call site is what Discord,
-        // Telegram and WeChat do, and it covers paragraphs, split chunks and
-        // the oversize-stream handoff in one place.
+        // The transport-level backstop Telegram, WeChat and WhatsApp Web also
+        // keep. The orchestrator strips envelopes from assistant text before
+        // either a draft frame or a finalized reply, but nothing in the trait
+        // obliges a caller to have run that pass, and this method also carries
+        // `multi_message` paragraphs, split chunks and the oversize-stream
+        // handoff. Stripping once here covers all of them.
         let content = crate::util::strip_tool_call_tags(&message.content);
         // A paragraph that was nothing but an envelope has nothing left to
         // say. Teams rejects an empty activity, and the caller wanted that

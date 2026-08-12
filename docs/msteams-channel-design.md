@@ -550,32 +550,33 @@ same setting does on Discord and Matrix:
   answer or reorder what follows it.
 - The finalize message is what the streamed paragraphs did not deliver,
   measured as the text after the prefix common to the delivered messages and
-  the finalized answer. The two are not the same string: the orchestrator
-  streams a text with only `<think>` blocks removed, then finalizes with one
-  that also had tool-call tags, tool narration and protocol artifacts stripped
-  and credentials redacted, and is trimmed. A byte offset into the stream
+  the finalized answer. The two are not the same string. The streamed text is
+  sanitized at the assistant boundary (`sanitize_streaming_draft_text`,
+  `orchestrator/mod.rs:3670`), and truncates protocol that has not finished
+  arriving; the finalized text goes through the delivery sanitizer, which on
+  top of the same passes strips the `[Used tools: ...]` prefix and tool
+  narration, redacts credentials, and trims. A byte offset into the stream
   therefore does not address the finalized text; it lands past the end
   whenever sanitizing shortened it (including the ordinary case of the last
   paragraph consuming a trailing blank line the answer no longer carries), and
   it shifts by whatever sanitizing removed earlier. The common prefix is what
   demonstrably reached the conversation, so identical texts yield exactly the
   tail after the last paragraph, and divergent ones deliver the sanitized
-  remainder without repeating a delivered paragraph. Discord (`:3585`) and
-  Matrix (`:3701`) cut at the offset and send nothing when it overruns, which
-  drops the tail instead.
+  remainder without repeating a delivered paragraph. Discord
+  (`discord/mod.rs:3589`) and Matrix (`matrix.rs:3705`) cut at the offset and
+  send nothing when it overruns, which drops the tail instead.
 - A divergence in mid-answer, a tool-call envelope between two paragraphs being
   the everyday case, ends the common prefix there, so the tail would restate
   every paragraph that followed it. Those paragraphs are in the record
   verbatim, so a tail that is already the ending of what went out is treated as
   owed to no one.
-- Outbound sends strip tool-call tags, which is what puts that class of
-  protocol artifact out of reach of a `multi_message` paragraph: the paragraphs
-  are published from the lightly-stripped streamed text, so leaving the strip
-  in finalize alone (where it started) covered `partial` and missed them
-  entirely. Discord strips in its `send` (`:1719`) for the same reason and
-  Telegram in both (`:3391`, `:3634`); Matrix does neither. A paragraph that
-  was nothing but an envelope is skipped rather than posted blank, which Teams
-  would reject anyway.
+- Outbound sends strip tool-call tags. The orchestrator already removes them
+  from the streamed text a paragraph is published from, so this is the
+  transport-level backstop Discord (`discord/mod.rs:1723`), Telegram (`:3406`,
+  `:3649`), WeChat and WhatsApp Web also keep, covering the callers of `send`
+  that are not a draft frame; Matrix keeps none. A paragraph that was nothing
+  but an envelope is skipped rather than posted blank, which Teams would reject
+  anyway.
 - A section separator (`---` and the other thematic breaks) is withheld for the
   same reason: Teams' message markdown has no horizontal rule, so a paragraph
   that is nothing else arrives as an empty bubble, and the message boundary
@@ -584,15 +585,16 @@ same setting does on Discord and Matrix:
   paragraphs, 0 among 19, and 6 among 27, so a third of the first answer would
   have been blank messages. Inside a larger message the break is merely
   dropped, so only a message that is nothing else is affected.
-- Known limitation, shared with Discord and Matrix: the remaining outbound
-  stages, tool narration stripping and credential redaction, live in the
-  orchestrator's finalize path and so never run on a streamed paragraph. In
-  `partial` that text is only displayed transiently before the sanitized final
-  message replaces it, but a `multi_message` paragraph is a permanent message.
-  Closing it needs the streaming contract in `orchestrator/mod.rs` (the delta
-  task at `:5199`) to sanitize per paragraph rather than per accumulation,
-  since a credential split across two deltas matches no pattern until it is
-  whole; it changes all three channels and is tracked separately.
+- Known limitation, shared with Discord and Matrix: the outbound stages the
+  draft boundary does not run, tool narration stripping and credential
+  redaction, live in the orchestrator's finalize path and so never reach a
+  streamed paragraph. In `partial` that text is only displayed transiently
+  before the sanitized final message replaces it, but a `multi_message`
+  paragraph is a permanent message. Closing it needs the delta task
+  (`run_draft_updater`, `orchestrator/mod.rs:3807`) to sanitize per paragraph
+  rather than per accumulation, since a credential split across two deltas
+  matches no pattern until it is whole; it changes all three channels and is
+  tracked separately.
 - Because these are ordinary sends, `multi_message` works in personal chats,
   group chats, and team channels alike — unlike `partial`.
 
@@ -660,7 +662,7 @@ channel-wide (see the field note above).
 | `crates/zeroclaw-api/src/channel.rs` | add `supports_draft_updates_for(&self, msg)` to the `Channel` trait **with a default implementation** delegating to `supports_draft_updates()`, so no other channel changes behavior. Teams overrides it because its draft support depends on conversation type; the orchestrator's two draft/typing decision sites call the per-message form. |
 | `crates/zeroclaw-channels/src/paced_channel.rs` | forward `supports_draft_updates_for` to the wrapped channel, so the pacing wrapper does not flatten the per-message answer back to the capability-wide one. |
 | `.github/workflows/ci.yml` | dedicated `test-msteams` lane (`cargo nextest run -p zeroclaw-channels --features channel-msteams -E 'test(msteams)'`), added to the `gate` job's `needs` so it is a required check. Necessary because the default lanes never compile the feature. |
-| `src/channels/msteams.rs` + `src/channels/mod.rs` | `pub use zeroclaw_channels::msteams::*;` re-export |
+| `src/channels/` re-export | **Deliberately absent.** `mattermost` has a `src/channels/mattermost.rs` shim, but `src/channels/mod.rs` declares only `matrix` and `telegram`, so that file and most of its neighbours are orphans left behind by the crate split and are never compiled. A Teams copy would be dead code. |
 | `Cargo.toml` (workspace root), `Containerfile`, `dev/ci/docker-tags.toml`, `setup.bat` | wherever `channel-mattermost` appears in feature lists, that is the `channels-full` bundle, the `all-features` container tag, and the installer's `all` preset, but deliberately **not** the lean `dist` selection. Consequence: the prebuilt release binaries and the `minimal` / `default-features` / `dist` container tags do **not** carry Teams, while the published `all-features` tag does; operators on a lean artifact build from source with `--features channel-msteams` (or `channels-full`). The user guide states this explicitly. |
 | `docs/book/src/channels/msteams.md` + `SUMMARY.md` + `overview.md` | user-facing setup guide (separate docs PR) |
 
