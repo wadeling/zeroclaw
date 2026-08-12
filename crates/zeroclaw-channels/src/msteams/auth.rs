@@ -21,6 +21,7 @@
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Issuer of Bot Connector service tokens for multi-tenant bots.
@@ -38,9 +39,10 @@ pub const CONNECTOR_TOKEN_SCOPE: &str = "https://api.botframework.com/.default";
 /// Framework authentication spec ("allow for up to 5 minutes").
 const JWT_CLOCK_SKEW_LEEWAY_SECS: u64 = 300;
 
-/// Do not re-fetch the JWKS document more often than this when a token
-/// references an unknown `kid`. Bounds the damage of a flood of garbage
-/// tokens each triggering an outbound fetch.
+/// Minimum spacing between JWKS refresh *attempts*, successful or not.
+/// Inbound tokens name their `kid` before any signature is verified, so an
+/// unauthenticated flood of unknown key ids must not translate into one
+/// outbound fetch per request, including while the issuer is failing.
 const JWKS_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Force a JWKS re-fetch once the cache reaches this age, even for a
@@ -93,6 +95,13 @@ pub enum AuthError {
     UnknownKeyId(String),
     #[error("JWKS fetch failed: {0}")]
     JwksFetch(String),
+    /// The cached keys cannot be trusted (absent, or older than
+    /// [`JWKS_MAX_AGE`]) and the refresh rate limit forbids a fetch right
+    /// now. Distinct from [`AuthError::UnknownKeyId`]: the key set could
+    /// not be consulted at all, so this signals a broken issuer or a token
+    /// flood rather than a token that names a retired key.
+    #[error("no trusted JWKS available: cache is stale or empty and refresh is rate-limited")]
+    KeysUnavailable,
     #[error("JWKS entry for key id {kid:?} is not a usable RSA key: {reason}")]
     UnusableJwk { kid: String, reason: String },
     #[error("JWT rejected: {0}")]
@@ -173,13 +182,56 @@ struct JwksCache {
     /// unknown-`kid` misses and once the cache passes [`JWKS_MAX_AGE`],
     /// never edited locally.
     keys: HashMap<String, JwkKey>,
+    /// When [`JwksCache::keys`] was last replaced by a successful fetch.
+    /// Decides whether the cache may still serve a key at all
+    /// ([`JWKS_MAX_AGE`]), so a failing issuer can never extend the life of
+    /// a key set.
     last_fetch: Option<Instant>,
+    /// When a fetch was last *attempted*, regardless of outcome. Decides
+    /// whether another attempt is allowed
+    /// ([`JWKS_REFRESH_MIN_INTERVAL`]). Kept separate from `last_fetch`
+    /// because throttling on success alone leaves every request free to
+    /// re-probe an issuer that is down.
+    last_attempt: Option<Instant>,
+}
+
+/// What a call to [`JwtValidator::refresh_jwks`] actually did.
+#[derive(Debug, PartialEq, Eq)]
+enum RefreshOutcome {
+    /// The issuer answered and [`JwksCache::keys`] now holds its current
+    /// key set.
+    Refreshed,
+    /// The refresh interval had not elapsed, so no request was made and the
+    /// cache is untouched.
+    Throttled,
+}
+
+/// Supplies the HTTP client for an auth-side request.
+///
+/// Both auth egresses are resolved through one of these rather than
+/// holding a client, because the proxy that has to carry them lives in
+/// live config: a handle built once at startup would keep dialing direct
+/// after a reload changed it. The channel installs a resolver that reads
+/// the same per-channel `proxy_url` its Connector sends use.
+pub type HttpClientResolver = Arc<dyn Fn() -> reqwest::Client + Send + Sync>;
+
+/// The client used when no resolver is installed.
+///
+/// This still goes through the runtime proxy, so a caller that forgets to
+/// install a resolver loses the per-channel `proxy_url` override but keeps
+/// the global `[proxy]` settings the rest of the daemon obeys. A bare
+/// `Client::builder()` here would honor only the environment variables, and
+/// silently dialing Microsoft direct is the failure this resolver exists to
+/// prevent — it presents as inbound activities rejected with 401 while the
+/// proxy looks correctly configured.
+fn default_auth_client() -> reqwest::Client {
+    zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts("channel.msteams", 10, 10)
 }
 
 /// Validates inbound Bot Connector service tokens against the issuer's
 /// published JWKS.
 pub struct JwtValidator {
-    http: reqwest::Client,
+    http: HttpClientResolver,
     openid_metadata_url: String,
     jwks: tokio::sync::RwLock<JwksCache>,
     refresh_min_interval: Duration,
@@ -193,15 +245,20 @@ impl JwtValidator {
     #[must_use]
     pub fn new(openid_metadata_url: impl Into<String>) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap_or_default(),
+            http: Arc::new(default_auth_client),
             openid_metadata_url: openid_metadata_url.into(),
             jwks: tokio::sync::RwLock::new(JwksCache::default()),
             refresh_min_interval: JWKS_REFRESH_MIN_INTERVAL,
             max_age: JWKS_MAX_AGE,
         }
+    }
+
+    /// Route JWKS fetches through the caller's client, so they honor the
+    /// channel's proxy instead of dialing Microsoft directly.
+    #[must_use]
+    pub fn with_http_client_resolver(mut self, http: HttpClientResolver) -> Self {
+        self.http = http;
+        self
     }
 
     /// Test hook: allow immediate JWKS re-fetches so key-rotation paths
@@ -256,18 +313,29 @@ impl JwtValidator {
         })
     }
 
-    /// Resolve `kid` from the cache, returning the RSA key and its channel
-    /// endorsements. Refreshes from the issuer once (rate-limited) on a
-    /// miss to pick up rotated keys, and once the cache passes
-    /// [`JWKS_MAX_AGE`] so a withdrawn key stops validating even while its
-    /// `kid` is still cached.
+    /// Resolve `kid` to its RSA key and channel endorsements.
+    ///
+    /// Every path that serves a key without having fetched it is guarded
+    /// by [`JWKS_MAX_AGE`], so a key set the issuer may have changed can
+    /// never be used past that age, whether the refresh failed or was
+    /// rate-limited.
     async fn decoding_key(&self, kid: &str) -> Result<(DecodingKey, Vec<String>), AuthError> {
         if self.cache_within_max_age().await
             && let Some(key) = self.cached_key(kid).await?
         {
             return Ok(key);
         }
-        self.refresh_jwks().await?;
+        // A throttled call issued no request of its own, but a concurrent
+        // caller may have completed a refresh while this one queued on the
+        // write lock, so the cache is consulted again rather than rejected
+        // outright. It may only be trusted while the age bound still
+        // vouches for it; a refreshed call just replaced the key set and
+        // reads it directly.
+        if self.refresh_jwks().await? == RefreshOutcome::Throttled
+            && !self.cache_within_max_age().await
+        {
+            return Err(AuthError::KeysUnavailable);
+        }
         match self.cached_key(kid).await? {
             Some(key) => Ok(key),
             None => Err(AuthError::UnknownKeyId(kid.to_string())),
@@ -296,19 +364,24 @@ impl JwtValidator {
             })
     }
 
-    async fn refresh_jwks(&self) -> Result<(), AuthError> {
+    async fn refresh_jwks(&self) -> Result<RefreshOutcome, AuthError> {
         let mut cache = self.jwks.write().await;
         if cache
-            .last_fetch
+            .last_attempt
             .is_some_and(|last| last.elapsed() < self.refresh_min_interval)
         {
-            // Recently refreshed; an unknown kid stays unknown rather
-            // than triggering another outbound fetch.
-            return Ok(());
+            return Ok(RefreshOutcome::Throttled);
         }
+        // Stamped before the requests and kept even if they fail, so a
+        // failing issuer is probed at most once per interval. Callers that
+        // queued on this write lock see the closed window and do not pile
+        // on a second attempt.
+        cache.last_attempt = Some(Instant::now());
 
-        let metadata: OpenIdMetadata = self
-            .http
+        // One client for both legs of the refresh: resolved here rather
+        // than held, so the proxy in force is the one config names now.
+        let http = (self.http)();
+        let metadata: OpenIdMetadata = http
             .get(&self.openid_metadata_url)
             .send()
             .await
@@ -319,8 +392,7 @@ impl JwtValidator {
             .await
             .map_err(|err| AuthError::JwksFetch(err.to_string()))?;
 
-        let jwks: JwksDocument = self
-            .http
+        let jwks: JwksDocument = http
             .get(&metadata.jwks_uri)
             .send()
             .await
@@ -348,7 +420,7 @@ impl JwtValidator {
             })
             .collect();
         cache.last_fetch = Some(Instant::now());
-        Ok(())
+        Ok(RefreshOutcome::Refreshed)
     }
 }
 
@@ -377,7 +449,7 @@ struct CachedToken {
 /// credential minted by Entra at runtime — the source of truth for the
 /// *credentials* stays in config and is passed in per call.
 pub struct ConnectorTokenProvider {
-    http: reqwest::Client,
+    http: HttpClientResolver,
     token_url: String,
     cached: tokio::sync::RwLock<Option<CachedToken>>,
 }
@@ -386,13 +458,18 @@ impl ConnectorTokenProvider {
     #[must_use]
     pub fn new(token_url: impl Into<String>) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap_or_default(),
+            http: Arc::new(default_auth_client),
             token_url: token_url.into(),
             cached: tokio::sync::RwLock::new(None),
         }
+    }
+
+    /// Route token requests through the caller's client, so they honor
+    /// the channel's proxy instead of dialing Entra directly.
+    #[must_use]
+    pub fn with_http_client_resolver(mut self, http: HttpClientResolver) -> Self {
+        self.http = http;
+        self
     }
 
     /// Provider for a tenant's production Entra token endpoint.
@@ -414,8 +491,7 @@ impl ConnectorTokenProvider {
             return Ok(token.access_token.clone());
         }
 
-        let response = self
-            .http
+        let response = (self.http)()
             .post(&self.token_url)
             .form(&[
                 ("grant_type", "client_credentials"),
@@ -509,6 +585,7 @@ mod tests {
     use super::*;
     use jsonwebtoken::{EncodingKey, Header};
     use serde::Serialize;
+    use std::sync::Arc;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -914,6 +991,332 @@ mod tests {
         assert!(
             key_fetches >= 2,
             "a stale cache must re-fetch the JWKS even when the kid is known, got {key_fetches}"
+        );
+    }
+
+    /// Metadata resolves, but the JWKS document itself is broken.
+    async fn mock_failing_issuer(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/metadata"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": BOT_FRAMEWORK_ISSUER,
+                "jwks_uri": format!("{}/keys", server.uri()),
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/keys"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(server)
+            .await;
+    }
+
+    fn path_hits(requests: &[wiremock::Request], path: &str) -> usize {
+        requests.iter().filter(|r| r.url.path() == path).count()
+    }
+
+    /// Marks the resolver's client so the server can tell which client
+    /// actually made a request. A held client would carry no marker.
+    const EGRESS_PROBE_UA: &str = "zeroclaw-auth-egress-probe";
+
+    fn probe_resolver() -> HttpClientResolver {
+        Arc::new(|| {
+            reqwest::Client::builder()
+                .user_agent(EGRESS_PROBE_UA)
+                .build()
+                .expect("probe client builds")
+        })
+    }
+
+    fn paths_from_the_probe(requests: &[wiremock::Request]) -> Vec<String> {
+        requests
+            .iter()
+            .filter(|r| {
+                r.headers
+                    .get(reqwest::header::USER_AGENT)
+                    .and_then(|value| value.to_str().ok())
+                    == Some(EGRESS_PROBE_UA)
+            })
+            .map(|r| r.url.path().to_string())
+            .collect()
+    }
+
+    /// A deployment behind a corporate proxy configures it once, on the
+    /// channel; if the JWKS fetch keeps its own client it dials Microsoft
+    /// directly and every inbound activity fails authentication while
+    /// outbound sends look fine.
+    #[tokio::test]
+    async fn jwks_fetch_leaves_through_the_resolved_client() {
+        let server = MockServer::start().await;
+        mock_issuer(&server, TEST_KID).await;
+
+        let validator = JwtValidator::new(format!("{}/metadata", server.uri()))
+            .with_http_client_resolver(probe_resolver());
+        let token = mint(BOT_FRAMEWORK_ISSUER, APP_ID, future_exp(), Some(TEST_KID));
+        validator
+            .validate(&token, APP_ID, &issuers())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            paths_from_the_probe(&server.received_requests().await.unwrap()),
+            vec!["/metadata".to_string(), "/keys".to_string()],
+            "both legs of the refresh must use the channel's client"
+        );
+    }
+
+    /// Same for the Entra token: without it a proxied deployment cannot
+    /// mint a Connector token, so no reply goes out either.
+    #[tokio::test]
+    async fn connector_token_leaves_through_the_resolved_client() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "tok-1",
+                "expires_in": 3600,
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = ConnectorTokenProvider::new(format!("{}/token", server.uri()))
+            .with_http_client_resolver(probe_resolver());
+        assert_eq!(provider.token("app-1", "secret-1").await.unwrap(), "tok-1");
+
+        assert_eq!(
+            paths_from_the_probe(&server.received_requests().await.unwrap()),
+            vec!["/token".to_string()],
+            "the token request must use the channel's client"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_attempts_are_rate_limited() {
+        let server = MockServer::start().await;
+        mock_failing_issuer(&server).await;
+
+        // Production interval. Unknown key ids are attacker-controlled and
+        // reach this path before any signature check, so a failing issuer
+        // must not be re-probed once per inbound request.
+        let validator = JwtValidator::new(format!("{}/metadata", server.uri()));
+        let unknown = mint(BOT_FRAMEWORK_ISSUER, APP_ID, future_exp(), Some("rotated"));
+
+        let first = validator
+            .validate(&unknown, APP_ID, &issuers())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(first, AuthError::JwksFetch(_)),
+            "the attempt that actually failed should surface the fetch error, got {first:?}"
+        );
+
+        for _ in 0..5 {
+            let err = validator
+                .validate(&unknown, APP_ID, &issuers())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, AuthError::KeysUnavailable),
+                "a throttled request has no trusted key set to judge against, got {err:?}"
+            );
+        }
+
+        // Both endpoints are counted: asserting only the second one would
+        // still pass if the attempt were stamped after the metadata lookup,
+        // which would leave that lookup unthrottled.
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            (
+                path_hits(&requests, "/metadata"),
+                path_hits(&requests, "/keys")
+            ),
+            (1, 1),
+            "repeated unknown key ids during a failing refresh must attempt only once per interval"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_metadata_lookup_is_rate_limited() {
+        let server = MockServer::start().await;
+        // The refresh dies at the first of the two Microsoft endpoints, so
+        // the JWKS document is never reached.
+        Mock::given(method("GET"))
+            .and(path("/metadata"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let validator = JwtValidator::new(format!("{}/metadata", server.uri()));
+        let unknown = mint(BOT_FRAMEWORK_ISSUER, APP_ID, future_exp(), Some("rotated"));
+
+        let first = validator
+            .validate(&unknown, APP_ID, &issuers())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(first, AuthError::JwksFetch(_)),
+            "the attempt that actually failed should surface the fetch error, got {first:?}"
+        );
+
+        for _ in 0..5 {
+            let err = validator
+                .validate(&unknown, APP_ID, &issuers())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, AuthError::KeysUnavailable),
+                "a throttled request has no trusted key set to judge against, got {err:?}"
+            );
+        }
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            (
+                path_hits(&requests, "/metadata"),
+                path_hits(&requests, "/keys")
+            ),
+            (1, 0),
+            "a failing metadata lookup must be throttled like a failing JWKS fetch"
+        );
+    }
+
+    /// A burst against an empty cache, as on startup or once the previous
+    /// key set passes [`JWKS_MAX_AGE`]. Several callers read the cache
+    /// concurrently, all miss, and all reach for the refresh; only one wins
+    /// and the rest are throttled. Being throttled behind a refresh that
+    /// succeeded is not grounds for rejection: the key set those callers
+    /// were waiting for is cached and within its age bound by the time they
+    /// get the lock.
+    ///
+    /// Whether the callers overlap is up to the scheduler, and a single
+    /// burst can be serialized into the winner finishing before the rest
+    /// start, which exercises the cache fast path instead. Each round is an
+    /// independent chance at the overlap, so several of them make a missed
+    /// regression vanishingly unlikely. No round can fail against correct
+    /// behaviour, where the whole burst is served off the one refresh.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_first_validates_share_one_refresh() {
+        const BURST: usize = 16;
+        const ROUNDS: usize = 5;
+
+        let server = MockServer::start().await;
+        mock_issuer(&server, TEST_KID).await;
+        let token = mint(BOT_FRAMEWORK_ISSUER, APP_ID, future_exp(), Some(TEST_KID));
+
+        for _ in 0..ROUNDS {
+            // Fresh per round: the empty cache is what sends the whole
+            // burst down the refresh path. Production refresh interval, so
+            // only the winner's attempt fits in the window and every other
+            // caller is throttled.
+            let validator = Arc::new(JwtValidator::new(format!("{}/metadata", server.uri())));
+            // Released together so the callers overlap on the cache read
+            // rather than trickling in behind a refresh that has already
+            // finished.
+            let start = Arc::new(tokio::sync::Barrier::new(BURST));
+            let mut burst = tokio::task::JoinSet::new();
+            for _ in 0..BURST {
+                let validator = validator.clone();
+                let token = token.clone();
+                let start = start.clone();
+                burst.spawn(async move {
+                    start.wait().await;
+                    validator.validate(&token, APP_ID, &issuers()).await
+                });
+            }
+            while let Some(joined) = burst.join_next().await {
+                joined.unwrap().expect(
+                    "a validate throttled behind a successful refresh must still be served",
+                );
+            }
+        }
+
+        assert_eq!(
+            path_hits(&server.received_requests().await.unwrap(), "/keys"),
+            ROUNDS,
+            "each round's burst must collapse into a single JWKS fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn over_age_cache_is_unusable_when_refresh_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/metadata"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": BOT_FRAMEWORK_ISSUER,
+                "jwks_uri": format!("{}/keys", server.uri()),
+            })))
+            .mount(&server)
+            .await;
+        // The key set loads once, then the issuer breaks.
+        Mock::given(method("GET"))
+            .and(path("/keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks_body(TEST_KID, TEST_KEY_N)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/keys"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        // Zero max-age: the cache is over-age immediately after loading, so
+        // the mandatory daily refresh applies to every validate.
+        let validator = JwtValidator::new(format!("{}/metadata", server.uri()))
+            .with_refresh_min_interval(Duration::ZERO)
+            .with_max_age(Duration::ZERO);
+        let token = mint(BOT_FRAMEWORK_ISSUER, APP_ID, future_exp(), Some(TEST_KID));
+
+        validator
+            .validate(&token, APP_ID, &issuers())
+            .await
+            .unwrap();
+
+        // `TEST_KID` is still in the cache, but the cache is past its age
+        // bound and the refresh that would renew it failed, so the token
+        // must be rejected instead of validated against retained keys.
+        let err = validator
+            .validate(&token, APP_ID, &issuers())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AuthError::JwksFetch(_)),
+            "an over-age cache must not validate a cached kid after a failed refresh, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn over_age_cache_is_unusable_when_refresh_is_throttled() {
+        let server = MockServer::start().await;
+        mock_issuer(&server, TEST_KID).await;
+
+        // Production refresh interval with a zero max-age: the first
+        // validate loads the keys and closes the refresh window, so the
+        // second one finds an over-age cache it is not allowed to renew.
+        // Throttling refresh attempts must not smuggle the retained keys
+        // back into use.
+        let validator =
+            JwtValidator::new(format!("{}/metadata", server.uri())).with_max_age(Duration::ZERO);
+        let token = mint(BOT_FRAMEWORK_ISSUER, APP_ID, future_exp(), Some(TEST_KID));
+
+        validator
+            .validate(&token, APP_ID, &issuers())
+            .await
+            .unwrap();
+
+        let err = validator
+            .validate(&token, APP_ID, &issuers())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AuthError::KeysUnavailable),
+            "a throttled mandatory refresh must leave the over-age cache unusable, got {err:?}"
+        );
+        assert_eq!(
+            path_hits(&server.received_requests().await.unwrap(), "/keys"),
+            1,
+            "the throttled validate must not have issued another JWKS request"
         );
     }
 

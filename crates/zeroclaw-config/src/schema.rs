@@ -13993,6 +13993,13 @@ fn default_matrix_draft_update_interval_ms() -> u64 {
     1500
 }
 
+/// Teams caps its streaming API at one request per second; Microsoft's own
+/// Teams AI SDK buffers to 1.5 s rather than sitting on the cap, so the
+/// default keeps the same headroom.
+fn default_msteams_draft_update_interval_ms() -> u64 {
+    1500
+}
+
 /// Telegram bot channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -14696,13 +14703,22 @@ pub struct MSTeamsConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub stream_mode: StreamMode,
-    /// Minimum interval (ms) between draft updates. Teams rate-limits
-    /// streaming updates to roughly one per second. Default: `1000`.
+    /// Minimum interval (ms) between draft updates, applied only when
+    /// `stream_mode = "partial"`. Teams throttles its streaming API to one
+    /// request per second, so lowering this risks `429`s; updates that arrive
+    /// early are skipped rather than queued, which costs nothing because each
+    /// one carries the full response so far. `0` disables the floor.
+    /// Default: `1500`, matching the buffer Microsoft's own Teams AI SDK
+    /// applies over the one-per-second cap.
     #[tab(Behavior)]
-    #[serde(default = "default_draft_update_interval_ms")]
+    #[serde(default = "default_msteams_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
     /// Delay (ms) between sending each paragraph when
-    /// `stream_mode = "multi_message"`. Default: `800`.
+    /// `stream_mode = "multi_message"`. Paragraphs are separate messages
+    /// counting against Teams' ceiling of 7 sends per second per
+    /// conversation, so this paces delivery instead of skipping it. `0`
+    /// disables pacing entirely and can trip that ceiling on a long reply.
+    /// Default: `800`.
     #[tab(Behavior)]
     #[serde(default = "default_multi_message_delay_ms")]
     pub multi_message_delay_ms: u64,
@@ -14754,7 +14770,7 @@ impl Default for MSTeamsConfig {
             allow_dms: true,
             mention_only: None,
             stream_mode: StreamMode::default(),
-            draft_update_interval_ms: default_draft_update_interval_ms(),
+            draft_update_interval_ms: default_msteams_draft_update_interval_ms(),
             multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: false,
             proxy_url: None,

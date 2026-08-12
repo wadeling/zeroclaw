@@ -59,7 +59,7 @@ port = 3978                           # inbound Bot Framework listener
 # allow_dms = true                    # false = ignore personal (1:1) chats
 # mention_only = true                 # group/channel must @-mention the bot
 # stream_mode = "partial"             # gray "thinking" bubble in 1:1 chats
-# draft_update_interval_ms = 1000
+# draft_update_interval_ms = 1500
 # interrupt_on_new_message = false
 
 # 2) Who may talk to the bot (Entra object ID preferred)
@@ -134,19 +134,66 @@ Set `stream_mode = "partial"` for progressive responses:
   status line or content chunk, so the bubble never flashes a `...`
   placeholder; answers that finish before any intermediate update arrive as
   a single plain message.
-- **Group chats and team channels** don't support native streaming. They show
-  the normal typing indicator, then receive one final reply. This avoids a
-  notification for an initial placeholder (such as `...`) while the completed
-  answer is only an edit.
+- **Group chats and team channels** don't support native streaming and receive
+  one final reply. This avoids a notification for an initial placeholder (such
+  as `...`) while the completed answer is only an edit. A group chat shows the
+  ordinary typing indicator while the turn runs; a team channel shows nothing,
+  because Teams has no typing indicator in a channel for anyone, bot or human.
+
+Teams allows one streaming response per chat at a time. If a second question
+arrives while the first is still being answered (which happens when
+`interrupt_on_new_message` is off), the second answer is delivered as one
+ordinary message instead of a second gray bubble.
+
+Two turns running at once share one conversation history, which is worth
+knowing before leaving `interrupt_on_new_message` off in a chat that uses
+`partial`. The later turn builds its prompt while the earlier question is still
+unanswered, so the agent tends to answer both in the later reply, and the
+earlier turn then delivers its own answer to the same question again. Turning
+`interrupt_on_new_message` on avoids this: the follow-up cancels the in-flight
+turn, whose bubble is removed, and only the newer question is answered. The
+cost is that any message sent during a slow turn discards it.
 
 Personal-chat updates are throttled by `draft_update_interval_ms` (default
-1000 ms; Teams rate-limits streaming updates to roughly one per second).
+1500 ms, the same headroom Microsoft's own SDK keeps over the one request per
+second Teams allows on its streaming API). An update that arrives early is
+skipped, which costs nothing because each one carries the full response so far.
+Status lines stop once the answer itself starts streaming, because Teams
+discards informative updates from that point on.
+
+Teams also requires the streamed text to grow monotonically: each update, and
+the final message, must contain what was streamed before it. An agent that runs
+tools mid-answer can compose a final response that is not a continuation of the
+text streamed earlier, and Teams then refuses the final message. When that
+happens the answer is delivered in full as an ordinary message and the
+in-progress bubble is removed, so the reply is never left sitting underneath a
+frozen draft. The only visible difference is that the bubble disappears instead
+of turning into the answer.
+
+The same thing happens to any turn that takes longer than two minutes, which is
+Teams' hard limit on a streaming session. Teams stops the bubble at that point
+and labels it "this response was stopped"; the answer then arrives as an
+ordinary message once the agent finishes, and the stopped bubble is removed.
+Expect this on turns with slow tools, and use `stream_mode = "multi_message"`
+instead if you would rather see partial output on long turns.
+
+Removing a bubble takes two steps, because Teams only ends a streaming
+response when the bot sends its closing message: the bubble is closed first
+and the resulting message is then deleted. If the delete does not go through,
+what stays in the conversation is a short line saying the response was
+superseded, rather than a bubble frozen mid-answer whose Stop button no longer
+works.
 
 `stream_mode = "multi_message"` sends the response as separate messages split
 on paragraph boundaries instead, in every conversation type (personal, group,
 and team channels). `multi_message_delay_ms` (default 800 ms) paces the sends.
-Group chats and team channels also show the ordinary typing indicator while the
-turn runs, regardless of `stream_mode`.
+A section separator such as `---` is not sent as a message of its own, since
+Teams draws no horizontal rule and it would arrive as an empty bubble; the
+message boundary separates the sections instead.
+Group chats show the ordinary typing indicator while the turn runs, regardless
+of `stream_mode`. Team channels show no indicator at any setting, so a long turn
+there is silent until the first message arrives; `multi_message` is the way to
+get visible progress in a channel.
 
 `interrupt_on_new_message` is resolved from the `default` alias and applied to
 every `msteams` alias: a value set only on a non-`default` alias is not honored,
@@ -160,6 +207,42 @@ are split into ordered chunks, preferring paragraph, then line, then word
 boundaries, so a long response is delivered in full rather than dropped. This
 applies to every `stream_mode` (including each `multi_message` paragraph); a
 reply that fits the budget is sent unchanged as a single message.
+
+Streaming is held to the same ceiling, and a stream cannot be split, since
+every update has to contain the text before it and the bubble closes with a
+single message. So in `partial` an answer that outgrows the budget stops
+updating the bubble, the bubble is removed, and the answer arrives as ordinary
+split messages. Status lines have their own, much smaller limit (1000
+characters) and are shortened with a trailing ellipsis if they exceed it.
+
+## Proxying
+
+`proxy_url` covers every call the channel makes outbound, not just the replies:
+fetching Microsoft's signing keys (which authenticates incoming activities) and
+requesting the Entra access token go through it as well. It falls back to the
+global `[proxy]` settings when unset. Inbound traffic is unaffected, since Teams
+connects to the endpoint you registered rather than the other way round.
+
+## Rate limits
+
+Teams allows a bot 7 sends per second in one conversation, with tighter budgets
+over longer windows (8 per 2 seconds, 60 per 30 seconds, 1800 per hour). That is
+separate from the 1 request per second its streaming API allows. Pacing is
+handled for you: `multi_message` paragraphs are spaced by
+`multi_message_delay_ms`, and the chunks of a split reply are spaced 500 ms
+apart so a long answer cannot trip a window on its own. Setting
+`multi_message_delay_ms = 0` turns that pacing off and can produce `429`s on
+long replies.
+
+If Teams does throttle an ordinary reply, it is retried a few times, honoring
+the service's `Retry-After` hint, so a brief burst is waited out instead of
+failing the reply. A conversation that stays throttled ends in a logged error
+rather than an unbounded wait. Throttled streaming frames and typing indicators
+are skipped instead of retried, since the next update supersedes them and
+waiting would stall the response. A throttled attempt to close the streaming
+bubble is not retried either: the answer is sent as an ordinary message
+straight away, which is both faster and the only thing that can work once the
+two-minute streaming window has passed.
 
 ## Threading
 
@@ -195,13 +278,18 @@ Operator-side, all in the Azure portal:
    sends, cron delivery, replies) requires the conversation's `serviceUrl`,
    which Teams supplies on inbound activities. After a daemon restart, each
    peer must message the bot once before it can reach them again.
-2. Teams expects the endpoint to answer within ~15 seconds. The listener
+2. **Outbound calls require TLS.** The connector token is equivalent to the
+   bot's password, so it is only sent to an `https` service URL (plain `http`
+   is accepted for a loopback address, which local test mocks use). Teams
+   always supplies an HTTPS `serviceUrl`; if a send fails with a non-HTTPS
+   destination error, something between the bot and Teams is rewriting it.
+3. Teams expects the endpoint to answer within ~15 seconds. The listener
    acknowledges immediately and runs the agent turn asynchronously, so slow
    model calls do not cause redelivery.
-3. The bot's identity (`28:…` ID and display name) is learned from the first
+4. The bot's identity (`28:…` ID and display name) is learned from the first
    inbound activity; `health_check` reports ready once the listener socket is
    bound.
-4. Media attachments, Adaptive Cards, reactions, and message deletion are not
+5. Media attachments, Adaptive Cards, reactions, and message deletion are not
    supported yet.
 
 ## See also

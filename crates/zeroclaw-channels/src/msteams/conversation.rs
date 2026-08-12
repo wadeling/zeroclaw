@@ -30,6 +30,14 @@ impl ConversationReference {
     pub fn is_personal(&self) -> bool {
         self.conversation_type.as_deref() == Some("personal")
     }
+
+    /// Whether this is a channel in a team, as opposed to a personal or
+    /// group chat. Threads and the typing indicator both turn on this:
+    /// only a channel has threads, and only a channel lacks the indicator.
+    #[must_use]
+    pub fn is_team_channel(&self) -> bool {
+        self.conversation_type.as_deref() == Some("channel")
+    }
 }
 
 /// Upper bound on stored references. A bot serving thousands of distinct
@@ -136,5 +144,27 @@ mod tests {
             ..reference("a:2")
         };
         assert!(!unknown.is_personal());
+    }
+
+    #[test]
+    fn is_team_channel_separates_channels_from_group_chats() {
+        let channel = ConversationReference {
+            conversation_type: Some("channel".to_string()),
+            ..reference("19:x@thread.tacv2")
+        };
+        assert!(channel.is_team_channel());
+        // A group chat is not a channel: it has no threads and, unlike a
+        // channel, Teams does render a typing indicator in it.
+        let group = ConversationReference {
+            conversation_type: Some("groupChat".to_string()),
+            ..reference("19:y@thread.v2")
+        };
+        assert!(!group.is_team_channel());
+        assert!(!reference("a:1").is_team_channel());
+        let unknown = ConversationReference {
+            conversation_type: None,
+            ..reference("a:2")
+        };
+        assert!(!unknown.is_team_channel());
     }
 }
