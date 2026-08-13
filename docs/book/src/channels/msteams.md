@@ -14,9 +14,11 @@ messaging.
 > release binaries and the `minimal`, `default-features`, and `dist` container
 > tags, so those artifacts cannot run it. It **is** part of the `channels-full`
 > bundle, so the published `all-features` container tag and the installer's
-> `all` preset do include it. On any other artifact, build from source, e.g.
-> `cargo build --release --no-default-features --features "dist,channel-msteams"`
-> or `cargo build --release --features channels-full`.
+> `all` preset do include it. On any other artifact, build from source with
+> `cargo build --release --features channel-msteams` for the default set plus
+> this channel, or `cargo build --release --features channels-full` for every
+> channel. Note that `dist` above names a container tag and a release
+> selection, not a Cargo feature, so it cannot be passed to `--features`.
 
 ## Who can talk to the agent
 
