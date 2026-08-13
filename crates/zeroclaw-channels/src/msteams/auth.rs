@@ -12,7 +12,8 @@
 //!   claim so the listener can bind them to the activity body.
 //! - **Outbound** — Connector API calls authenticate with an Entra
 //!   client-credentials token. [`ConnectorTokenProvider`] fetches one and
-//!   caches it until shortly before expiry.
+//!   caches it until shortly before expiry, or until the credentials it was
+//!   minted for stop matching the ones the caller passes.
 //!
 //! This is the only msteams module that touches key material or tokens.
 //! Credentials are passed in per call (resolved from canonical `Config`
@@ -20,6 +21,7 @@
 
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -442,6 +444,24 @@ struct TokenResponse {
 struct CachedToken {
     access_token: String,
     expires_at: Instant,
+    /// Fingerprint of the credential pair Entra minted this token for.
+    /// Source of truth created here: the credentials live in config and are
+    /// passed per call, but nothing else records which of them produced the
+    /// cached token, and a token outlives a rotation by up to its whole
+    /// lifetime. Hashed rather than kept, so the cache can answer "not the
+    /// same credentials" without holding the secret a second time.
+    minted_for: [u8; 32],
+}
+
+/// Identify a credential pair without retaining it. The length prefix keeps
+/// `("ab", "c")` and `("a", "bc")` apart, which a plain concatenation would
+/// merge into one fingerprint.
+fn credential_fingerprint(app_id: &str, app_password: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update((app_id.len() as u64).to_le_bytes());
+    hasher.update(app_id.as_bytes());
+    hasher.update(app_password.as_bytes());
+    hasher.finalize().into()
 }
 
 /// Fetches and caches the Entra client-credentials token used against the
@@ -478,16 +498,18 @@ impl ConnectorTokenProvider {
         Self::new(connector_token_url(tenant_id))
     }
 
-    /// Return a bearer token for the Connector API, fetching a fresh one
-    /// when none is cached or the cached one is inside the refresh margin.
+    /// Return a bearer token for the Connector API, fetching a fresh one when
+    /// none is cached, the cached one is inside the refresh margin, or it was
+    /// minted for different credentials than the caller now passes.
     pub async fn token(&self, app_id: &str, app_password: &str) -> Result<String, AuthError> {
-        if let Some(token) = self.fresh_cached_token().await {
+        let fingerprint = credential_fingerprint(app_id, app_password);
+        if let Some(token) = self.fresh_cached_token(&fingerprint).await {
             return Ok(token);
         }
 
         let mut cached = self.cached.write().await;
         // Another task may have refreshed while this one waited on the lock.
-        if let Some(token) = cached.as_ref().filter(|t| Self::is_fresh(t)) {
+        if let Some(token) = cached.as_ref().filter(|t| Self::is_usable(t, &fingerprint)) {
             return Ok(token.access_token.clone());
         }
 
@@ -516,16 +538,21 @@ impl ConnectorTokenProvider {
         *cached = Some(CachedToken {
             access_token: token.access_token,
             expires_at: Instant::now() + Duration::from_secs(token.expires_in),
+            minted_for: fingerprint,
         });
         Ok(access_token)
     }
 
-    async fn fresh_cached_token(&self) -> Option<String> {
+    async fn fresh_cached_token(&self, fingerprint: &[u8; 32]) -> Option<String> {
         let cached = self.cached.read().await;
         cached
             .as_ref()
-            .filter(|t| Self::is_fresh(t))
+            .filter(|t| Self::is_usable(t, fingerprint))
             .map(|t| t.access_token.clone())
+    }
+
+    fn is_usable(token: &CachedToken, fingerprint: &[u8; 32]) -> bool {
+        token.minted_for == *fingerprint && Self::is_fresh(token)
     }
 
     fn is_fresh(token: &CachedToken) -> bool {
@@ -1341,6 +1368,66 @@ mod tests {
         assert_eq!(provider.token("app-1", "secret-1").await.unwrap(), "tok-1");
         // Second call must come from the cache (the mock allows one hit).
         assert_eq!(provider.token("app-1", "secret-1").await.unwrap(), "tok-1");
+    }
+
+    #[tokio::test]
+    async fn rotated_credentials_mint_a_new_connector_token() {
+        let server = MockServer::start().await;
+        // Distinct bodies per credential pair, so the assertions below prove
+        // which pair each token was minted for rather than just counting.
+        for (secret, token) in [("secret-1", "tok-1"), ("secret-2", "tok-2")] {
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .and(body_string_contains("client_id=app-1"))
+                .and(body_string_contains(format!("client_secret={secret}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": token,
+                    "expires_in": 3600,
+                })))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("client_id=app-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "tok-other-app",
+                "expires_in": 3600,
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = ConnectorTokenProvider::new(format!("{}/token", server.uri()));
+        assert_eq!(provider.token("app-1", "secret-1").await.unwrap(), "tok-1");
+        assert_eq!(
+            provider.token("app-1", "secret-1").await.unwrap(),
+            "tok-1",
+            "unchanged credentials must still be served from the cache"
+        );
+
+        // Rotated secret, same tenant and app: the cached token is still
+        // inside its hour, but it belongs to the retired secret.
+        assert_eq!(
+            provider.token("app-1", "secret-2").await.unwrap(),
+            "tok-2",
+            "a rotated secret must not keep sending the token minted for the old one"
+        );
+        // Same again for a swapped bot identity, which would otherwise post
+        // as the previous app until the hour ran out.
+        assert_eq!(
+            provider.token("app-2", "secret-2").await.unwrap(),
+            "tok-other-app",
+            "a changed app id must not keep sending the previous app's token"
+        );
+
+        let posts = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == "/token")
+            .count();
+        assert_eq!(posts, 3, "one mint per distinct credential pair");
     }
 
     #[tokio::test]

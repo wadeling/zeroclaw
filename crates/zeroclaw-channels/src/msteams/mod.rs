@@ -601,7 +601,9 @@ impl MsTeamsChannel {
     }
 
     /// Token provider for the current tenant, rebuilt if `tenant_id`
-    /// changed since the last send.
+    /// changed since the last send. A changed `app_id` or `app_password`
+    /// needs no rebuild: the provider mints per credential pair and only
+    /// serves a cached token back to the pair it was minted for.
     async fn connector_provider(&self, tenant_id: &str) -> Arc<auth::ConnectorTokenProvider> {
         {
             let guard = self.connector.read().await;
