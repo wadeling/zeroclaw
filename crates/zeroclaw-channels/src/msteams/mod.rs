@@ -942,7 +942,18 @@ impl MsTeamsChannel {
     /// [`DraftKind::Streaming`] handle is never a key in that map.
     fn clear_draft_state(&self, recipient: &str, draft_id: &str) -> Option<OpenedStream> {
         let removed = self.draft_streams.lock().remove(draft_id);
-        self.last_draft_update.lock().remove(recipient);
+        // Only when this call is the one that owned the draft. The pacing map
+        // is keyed by recipient rather than by handle, and `finalize_draft`
+        // clears twice: once inside delivery, before the closing activity,
+        // and again on the way out. The freed stream slot lets the next turn
+        // in this chat open its own draft during that request, so a second,
+        // draft-less clear would drop *its* interval floor and let its next
+        // frame go out early. A `DraftKind::Streaming` handle is registered
+        // by `send_draft` before it is ever handed out, so `removed` is
+        // `Some` exactly on the clear that owns one.
+        if removed.is_some() {
+            self.last_draft_update.lock().remove(recipient);
+        }
         removed.and_then(|draft| {
             draft.stream_id.map(|id| OpenedStream {
                 id,
@@ -1065,6 +1076,75 @@ impl MsTeamsChannel {
             self.send(&msg).await?;
         }
         Ok(())
+    }
+
+    /// Deliver a native-streaming draft's final answer: the closing
+    /// `message` activity when the stream opened, an ordinary message when
+    /// it never did. Called only through [`Channel::finalize_draft`],
+    /// which clears the draft's state for whatever this returns.
+    async fn finalize_streaming_draft(
+        &self,
+        recipient: &str,
+        draft_id: &str,
+        text: &str,
+    ) -> Result<()> {
+        let (_, ctx) = self.send_context(recipient).await?;
+        let text = crate::util::strip_tool_call_tags(text);
+        // No `replyToId` and no thread suffix, unlike the ordinary send the
+        // orchestrator falls back to. Neither is reachable from this method —
+        // the trait passes the draft handle, not the message that started the
+        // turn — and neither would show anything: a partial draft only exists
+        // in a personal chat, where Teams has no threads and renders a
+        // `replyToId` reply as a plain message at the end of the conversation
+        // (visual threading is a channel-only feature). Channel threading runs
+        // through `multi_message`, whose state carries the anchor.
+        let url = Self::activities_url(&ctx.reference, &ctx.base_id, None)?;
+
+        let stream = self.clear_draft_state(recipient, draft_id);
+        // A stream carries its answer in one activity and cannot chunk it, so
+        // an oversize response has no way to close the bubble on its own
+        // content: the final message is refused for the same size reason its
+        // frames were. Close it on what already streamed and deliver through
+        // `send`, which splits. Without this the request is spent only to
+        // fail, and the reply arrives by way of the caller's error fallback.
+        if text.chars().count() > TEAMS_MAX_MESSAGE_CHARS {
+            if let Some(stream) = stream.as_ref() {
+                let _ = Self::close_stream_activity(&ctx, stream, &Self::cancelled_notice()).await;
+            }
+            return self.send(&SendMessage::new(&text, recipient)).await;
+        }
+        let body = match stream.as_ref() {
+            Some(stream) => {
+                streaming_activity_body("message", &text, "final", None, Some(&stream.id))
+            }
+            None => serde_json::json!({ "type": "message", "text": text }),
+        };
+        // Not waited out, even though it carries the answer: the caller
+        // resends the whole thing through `send()` if this fails, and those
+        // chunks retry. Waiting here would only delay that fallback, and once
+        // the stream has passed its two-minute deadline every attempt is
+        // spent on a session that cannot accept the message anyway.
+        let delivered = Self::activity_request(
+            &ctx,
+            reqwest::Method::POST,
+            url,
+            &body,
+            ThrottlePolicy::FailFast,
+        )
+        .await;
+        if let (Err(_), Some(stream)) = (&delivered, stream.as_ref()) {
+            // A failed finalize is answered by resending the reply as an
+            // ordinary message, so the opened bubble has to go or the answer
+            // lands underneath a draft frozen on whatever streamed last.
+            // Teams refuses a final message that does not extend the content
+            // already streamed, which a tool loop trips whenever its answer
+            // is not a continuation of an earlier text segment, so this is a
+            // routine outcome rather than a rare one. Closing on the streamed
+            // content is the one final message that cannot be refused for
+            // that reason.
+            let _ = Self::close_stream_activity(&ctx, stream, &Self::cancelled_notice()).await;
+        }
+        delivered.map(|_| ())
     }
 
     /// POST one streaminfo activity for a draft, opening the Teams
@@ -1933,63 +2013,40 @@ impl Channel for MsTeamsChannel {
                 .finalize_multi_message(message_id, recipient, text)
                 .await;
         }
-        let (_, ctx) = self.send_context(recipient).await?;
-        let text = crate::util::strip_tool_call_tags(text);
-        // No `replyToId` and no thread suffix, unlike the ordinary send the
-        // orchestrator falls back to. Neither is reachable from this method —
-        // the trait passes the draft handle, not the message that started the
-        // turn — and neither would show anything: a partial draft only exists
-        // in a personal chat, where Teams has no threads and renders a
-        // `replyToId` reply as a plain message at the end of the conversation
-        // (visual threading is a channel-only feature). Channel threading runs
-        // through `multi_message`, whose state carries the anchor.
-        let url = Self::activities_url(&ctx.reference, &ctx.base_id, None)?;
-
-        let stream = self.clear_draft_state(recipient, message_id);
-        // A stream carries its answer in one activity and cannot chunk it, so
-        // an oversize response has no way to close the bubble on its own
-        // content: the final message is refused for the same size reason its
-        // frames were. Close it on what already streamed and deliver through
-        // `send`, which splits. Without this the request is spent only to
-        // fail, and the reply arrives by way of the caller's error fallback.
-        if text.chars().count() > TEAMS_MAX_MESSAGE_CHARS {
-            if let Some(stream) = stream.as_ref() {
-                let _ = Self::close_stream_activity(&ctx, stream, &Self::cancelled_notice()).await;
+        let delivered = self
+            .finalize_streaming_draft(recipient, message_id, text)
+            .await;
+        if let Err(err) = &delivered {
+            // The handle is spent whatever happened, and nothing revisits a
+            // draft the orchestrator has already fallen back on. Delivery
+            // clears the state itself once it owns a context, so this only
+            // fires when a preflight — live config, the conversation
+            // reference, or the Connector token — returned before that
+            // point. Left registered, the entry would hold this chat's one
+            // stream slot until it aged past [`TEAMS_STREAM_SESSION_LIMIT`]
+            // and would never leave the map at all, since removal happens
+            // nowhere else. Clearing is idempotent, so the paths that
+            // already cleared pay nothing.
+            if let Some(stream) = self.clear_draft_state(recipient, message_id) {
+                // Getting a stream back means the preflight failed with the
+                // bubble already up: every path that reaches the wire closes
+                // it and has cleared this state itself. Taking it down needs
+                // the context that could not be resolved, so nothing is
+                // retried and this is the only record that a bubble was left
+                // on screen.
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "stream_id": stream.id,
+                            "error": format!("{err}"),
+                        })),
+                    "Teams draft finalize failed its preflight; its bubble stays on screen"
+                );
             }
-            return self.send(&SendMessage::new(&text, recipient)).await;
         }
-        let body = match stream.as_ref() {
-            Some(stream) => {
-                streaming_activity_body("message", &text, "final", None, Some(&stream.id))
-            }
-            None => serde_json::json!({ "type": "message", "text": text }),
-        };
-        // Not waited out, even though it carries the answer: the caller
-        // resends the whole thing through `send()` if this fails, and those
-        // chunks retry. Waiting here would only delay that fallback, and once
-        // the stream has passed its two-minute deadline every attempt is
-        // spent on a session that cannot accept the message anyway.
-        let delivered = Self::activity_request(
-            &ctx,
-            reqwest::Method::POST,
-            url,
-            &body,
-            ThrottlePolicy::FailFast,
-        )
-        .await;
-        if let (Err(_), Some(stream)) = (&delivered, stream.as_ref()) {
-            // A failed finalize is answered by resending the reply as an
-            // ordinary message, so the opened bubble has to go or the answer
-            // lands underneath a draft frozen on whatever streamed last.
-            // Teams refuses a final message that does not extend the content
-            // already streamed, which a tool loop trips whenever its answer
-            // is not a continuation of an earlier text segment, so this is a
-            // routine outcome rather than a rare one. Closing on the streamed
-            // content is the one final message that cannot be refused for
-            // that reason.
-            let _ = Self::close_stream_activity(&ctx, stream, &Self::cancelled_notice()).await;
-        }
-        delivered.map(|_| ())
+        delivered
     }
 
     /// Best-effort removal of an abandoned draft, as when
@@ -2006,10 +2063,31 @@ impl Channel for MsTeamsChannel {
         let Some(stream) = self.clear_draft_state(recipient, message_id) else {
             return Ok(());
         };
-        let Ok((_, ctx)) = self.send_context(recipient).await else {
-            return Ok(());
-        };
-        Self::close_stream_activity(&ctx, &stream, &Self::cancelled_notice()).await
+        match self.send_context(recipient).await {
+            Ok((_, ctx)) => {
+                Self::close_stream_activity(&ctx, &stream, &Self::cancelled_notice()).await
+            }
+            Err(err) => {
+                // Reported for the same reason a failed close is: a bubble
+                // that outlived the attempt looks exactly like one that was
+                // taken down. Nothing is retried here — taking the stream
+                // off the screen needs the very context that could not be
+                // resolved — so this is the only record that it was left
+                // there. The draft's state is already gone, which is what
+                // keeps the next turn in this chat able to stream.
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "stream_id": stream.id,
+                            "error": format!("{err}"),
+                        })),
+                    "Teams draft cancelled without a Connector context; its bubble stays on screen"
+                );
+                Ok(())
+            }
+        }
     }
 }
 
@@ -2740,6 +2818,26 @@ mod tests {
         (ch, live)
     }
 
+    /// The same, for the reload that removes `[channels.msteams.<alias>]`
+    /// altogether: the resolver then has no block to hand back, which is
+    /// the one `send_context` failure that needs no network to reproduce.
+    fn removable_draft_channel(
+        config: MSTeamsConfig,
+        connector: &MockServer,
+    ) -> (
+        MsTeamsChannel,
+        Arc<parking_lot::Mutex<Option<MSTeamsConfig>>>,
+    ) {
+        let live = Arc::new(parking_lot::Mutex::new(Some(config)));
+        let resolver = {
+            let live = Arc::clone(&live);
+            Arc::new(move || live.lock().clone())
+        };
+        let ch = MsTeamsChannel::new("default", resolver, Arc::new(Vec::new))
+            .with_token_url(format!("{}/token", connector.uri()));
+        (ch, live)
+    }
+
     fn record_reference(ch: &MsTeamsChannel, connector: &MockServer, id: &str, kind: &str) {
         ch.conversations.record(ConversationReference {
             service_url: format!("{}/teams/", connector.uri()),
@@ -2941,6 +3039,268 @@ mod tests {
         assert!(
             ch.draft_streams.lock().is_empty(),
             "a finalized draft keeps no state even when the stream is rejected"
+        );
+    }
+
+    /// The rejection above is the case where finalize got far enough to be
+    /// told no. It can also fail before that: `send_context` resolves live
+    /// config, the conversation reference, and an Entra token, and the
+    /// token exchange fails for reasons that have nothing to do with this
+    /// draft — an outage, a throttled token endpoint, a secret rotated to
+    /// the wrong value. The orchestrator answers by resending the reply as
+    /// an ordinary message and never looks at the handle again, so the
+    /// state has to go on the way out. Left registered it holds this
+    /// chat's one stream slot until it ages past
+    /// [`TEAMS_STREAM_SESSION_LIMIT`], and since removal happens nowhere
+    /// else it never leaves the map at all.
+    #[tokio::test]
+    async fn a_finalize_that_cannot_mint_a_token_still_frees_the_chat() {
+        let connector = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&connector)
+            .await;
+
+        let ch = draft_channel(streaming_config(), &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("...", "a:1conv"))
+            .await
+            .unwrap()
+            .unwrap();
+        ch.finalize_draft("a:1conv", &draft_id, "Final answer", false)
+            .await
+            .expect_err("without a Connector token nothing can be delivered");
+
+        assert!(
+            ch.draft_streams.lock().is_empty(),
+            "a draft the caller has already fallen back on must keep no state"
+        );
+        assert!(
+            ch.send_draft(&SendMessage::new("next turn", "a:1conv"))
+                .await
+                .unwrap()
+                .is_some(),
+            "the next turn in this chat must still be able to open a stream"
+        );
+    }
+
+    /// The same failure with the bubble already on screen. The token that
+    /// opened the stream is inside its refresh margin by finalize time, so
+    /// closing the bubble needs a fresh one and cannot get it: that bubble
+    /// stays up, and no local state can change it. What must not also
+    /// happen is the chat losing streaming behind a draft nobody will
+    /// finalize again.
+    #[tokio::test]
+    async fn a_finalize_whose_token_expired_frees_the_chat_with_the_bubble_open() {
+        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
+
+        let connector = MockServer::start().await;
+        // Expires inside `CONNECTOR_TOKEN_REFRESH_MARGIN`, so the next call
+        // re-mints rather than serving this one back.
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "connector-tok",
+                "expires_in": 10,
+            })))
+            .up_to_n_times(1)
+            .mount(&connector)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&connector)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(ACTIVITIES))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
+            )
+            .mount(&connector)
+            .await;
+
+        let ch = draft_channel(streaming_config(), &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("...", "a:1conv"))
+            .await
+            .unwrap()
+            .unwrap();
+        ch.update_draft("a:1conv", &draft_id, "A brown")
+            .await
+            .unwrap();
+        ch.finalize_draft("a:1conv", &draft_id, "A brown fox", false)
+            .await
+            .expect_err("the expired token cannot be replaced");
+
+        let posted = connector
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == ACTIVITIES)
+            .count();
+        assert_eq!(
+            posted, 1,
+            "the frame that opened the stream is all the credentials allowed"
+        );
+        assert!(
+            ch.draft_streams.lock().is_empty(),
+            "an opened draft that could not be closed still has to release its slot"
+        );
+        assert!(
+            ch.send_draft(&SendMessage::new("next turn", "a:1conv"))
+                .await
+                .unwrap()
+                .is_some(),
+            "the next turn in this chat must still be able to open a stream"
+        );
+    }
+
+    /// The config lever on the same path, and the one that needs no
+    /// network: an operator deletes `[channels.msteams.default]` and
+    /// reloads mid-turn, so `send_context` has no block to resolve. The
+    /// draft abandoned that way must not outlive the reload that puts the
+    /// section back.
+    #[tokio::test]
+    async fn a_finalize_after_the_config_block_is_removed_still_frees_the_chat() {
+        let connector = MockServer::start().await;
+        mock_token_endpoint(&connector).await;
+
+        let (ch, live) = removable_draft_channel(streaming_config(), &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("...", "a:1conv"))
+            .await
+            .unwrap()
+            .unwrap();
+        *live.lock() = None;
+        ch.finalize_draft("a:1conv", &draft_id, "Final answer", false)
+            .await
+            .expect_err("a channel with no config block cannot address the Connector");
+
+        assert!(
+            ch.draft_streams.lock().is_empty(),
+            "the draft must not survive the reload that abandoned it"
+        );
+        *live.lock() = Some(streaming_config());
+        assert!(
+            ch.send_draft(&SendMessage::new("next turn", "a:1conv"))
+                .await
+                .unwrap()
+                .is_some(),
+            "restoring the config must restore streaming for this chat"
+        );
+    }
+
+    /// Cancel has the same ownership problem in the other order: it takes
+    /// the state first and then needs a context to close the bubble with.
+    /// When that context cannot be resolved the cancel still reports
+    /// success, because every caller treats the takedown as best-effort,
+    /// but the state must stay gone — an abandoned turn cannot cost the
+    /// chat the turn that superseded it.
+    #[tokio::test]
+    async fn a_cancel_that_cannot_mint_a_token_still_frees_the_chat() {
+        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
+
+        let connector = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "connector-tok",
+                "expires_in": 10,
+            })))
+            .up_to_n_times(1)
+            .mount(&connector)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&connector)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(ACTIVITIES))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
+            )
+            .mount(&connector)
+            .await;
+
+        let ch = draft_channel(streaming_config(), &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("...", "a:1conv"))
+            .await
+            .unwrap()
+            .unwrap();
+        ch.update_draft("a:1conv", &draft_id, "A brown")
+            .await
+            .unwrap();
+        ch.cancel_draft("a:1conv", &draft_id)
+            .await
+            .expect("a takedown nobody can perform is not the caller's failure");
+
+        assert!(
+            ch.draft_streams.lock().is_empty(),
+            "cancel drops the draft's state whether or not the bubble could go"
+        );
+        assert!(
+            ch.send_draft(&SendMessage::new("next turn", "a:1conv"))
+                .await
+                .unwrap()
+                .is_some(),
+            "the turn that superseded this one must be able to stream"
+        );
+    }
+
+    /// Clearing twice is what makes the state release above unconditional,
+    /// and the pacing map is keyed by recipient rather than by handle. The
+    /// clear that no longer owns a draft therefore has to leave that key
+    /// alone: the first clear frees this chat's stream slot, so the next
+    /// turn can open a draft and push a frame while the finalize it belongs
+    /// to is still in flight, and dropping that draft's floor would send its
+    /// next frame inside the one request per second the Connector allows.
+    #[tokio::test]
+    async fn the_clear_that_owns_no_draft_keeps_a_newer_ones_interval_floor() {
+        let connector = MockServer::start().await;
+        let ch = draft_channel(streaming_config(), &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
+
+        let abandoned = ch
+            .send_draft(&SendMessage::new("...", "a:1conv"))
+            .await
+            .unwrap()
+            .unwrap();
+        ch.mark_draft_update("a:1conv");
+        ch.clear_draft_state("a:1conv", &abandoned);
+        assert!(
+            ch.last_draft_update.lock().is_empty(),
+            "the clear that owns the draft takes its floor with it"
+        );
+
+        // The next turn, opening while that finalize is still on the wire.
+        let successor = ch
+            .send_draft(&SendMessage::new("...", "a:1conv"))
+            .await
+            .unwrap()
+            .unwrap();
+        ch.mark_draft_update("a:1conv");
+
+        // The tail of the first finalize, once its request came back.
+        ch.clear_draft_state("a:1conv", &abandoned);
+        assert!(
+            ch.last_draft_update.lock().contains_key("a:1conv"),
+            "the successor's interval floor must survive a clear that is not its own"
+        );
+        assert!(
+            ch.draft_streams.lock().contains_key(&successor),
+            "and so must the successor itself"
         );
     }
 
