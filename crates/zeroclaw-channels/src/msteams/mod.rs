@@ -76,6 +76,55 @@ struct SendContext {
     token: String,
 }
 
+/// Which delivery lifecycle a draft handle was issued for. Source of
+/// truth created here, carried by the handle itself.
+///
+/// `stream_mode` is live config, re-resolved on every call, so a reload
+/// can flip it while a turn is in flight. The callbacks that follow
+/// [`MsTeamsChannel::send_draft`] therefore must not ask the current mode
+/// which implementation owns a draft: after a flip to `multi_message` they
+/// would finalize a native stream through paragraph state that never held
+/// it and deliver nothing, and after a flip away from it they would hand a
+/// paragraph-split draft to the streaming path, which has no record of what
+/// was already sent and would repeat the whole answer. Reading the kind off
+/// the handle keeps every callback on the lifecycle that created its state.
+/// Genuinely live values, credentials and pacing intervals, keep coming
+/// from current config.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DraftKind {
+    /// Teams native streaming: one bubble, re-sent frame by frame.
+    Streaming,
+    /// Paragraph-split delivery: each completed paragraph its own message.
+    MultiMessage,
+}
+
+impl DraftKind {
+    /// The handle prefix that marks this lifecycle.
+    const fn prefix(self) -> &'static str {
+        match self {
+            Self::Streaming => "draft-",
+            Self::MultiMessage => "multi-",
+        }
+    }
+
+    /// A fresh handle of this kind.
+    fn handle(self, serial: u64) -> String {
+        format!("{}{serial}", self.prefix())
+    }
+
+    /// The lifecycle a handle was issued for. Anything else takes the
+    /// streaming path, which falls back to a plain send when it finds no
+    /// draft state, so an unrecognized handle still delivers its answer
+    /// rather than dropping it.
+    fn of(handle: &str) -> Self {
+        if handle.starts_with(Self::MultiMessage.prefix()) {
+            Self::MultiMessage
+        } else {
+            Self::Streaming
+        }
+    }
+}
+
 /// Per-draft native-streaming state. Source of truth created here: the
 /// streaminfo sequence counter and the Teams-assigned `streamId` exist
 /// nowhere else and are dropped on finalize/cancel.
@@ -886,16 +935,14 @@ impl MsTeamsChannel {
             .insert(recipient.to_string(), Instant::now());
     }
 
-    /// Drop all local state for a draft (finalized or cancelled),
-    /// returning the stream it leaves on screen if one ever opened.
+    /// Drop all local state for a native-streaming draft (finalized or
+    /// cancelled), returning the stream it leaves on screen if one ever
+    /// opened. Paragraph-split drafts are torn down by
+    /// [`Self::finalize_multi_message`] and `cancel_draft` instead; a
+    /// [`DraftKind::Streaming`] handle is never a key in that map.
     fn clear_draft_state(&self, recipient: &str, draft_id: &str) -> Option<OpenedStream> {
         let removed = self.draft_streams.lock().remove(draft_id);
         self.last_draft_update.lock().remove(recipient);
-        // `stream_mode` is resolved from live config on every call, so a
-        // reload can hand a draft opened in `multi_message` to the
-        // partial/off teardown path. Dropping the entry here too keeps a
-        // draft's state from outliving the draft.
-        self.multi_message.lock().remove(draft_id);
         removed.and_then(|draft| {
             draft.stream_id.map(|id| OpenedStream {
                 id,
@@ -921,11 +968,9 @@ impl MsTeamsChannel {
         loop {
             let (paragraph, thread_ts, delivered_len, consumed) = {
                 let mut state = self.multi_message.lock();
-                // Missing when the draft opened under a different
-                // `stream_mode` and a config reload flipped it to
-                // `multi_message` afterwards, so no entry was ever created
-                // for it: the mode is resolved from live config on every
-                // call. Also missing once the draft has been torn down.
+                // Missing once the draft has been torn down: an abandoned
+                // turn whose `cancel_draft` already dropped its state, or a
+                // finalize that ran before this flush.
                 let Some(entry) = state.get_mut(draft_id) else {
                     return;
                 };
@@ -1542,6 +1587,20 @@ impl Channel for MsTeamsChannel {
                 self.alias,
             );
         }
+        // The secret is as load-bearing as the two ids above: Entra mints
+        // every Connector token from it, so an enabled channel without one
+        // would bind, report ready, accept activities, and then fail each
+        // reply at the token exchange. Refusing at startup puts that in the
+        // operator's log instead of one error per message.
+        if cfg.app_password.trim().is_empty() {
+            anyhow::bail!(
+                "Microsoft Teams channel '{}' requires `app_password`: Entra mints the \
+                 Connector token from it, so without it every reply fails; set it under \
+                 [channels.msteams.{}]",
+                self.alias,
+                self.alias,
+            );
+        }
 
         let path = if cfg.path.starts_with('/') {
             cfg.path.clone()
@@ -1692,10 +1751,8 @@ impl Channel for MsTeamsChannel {
                 {
                     return Ok(None);
                 }
-                let draft_id = format!(
-                    "draft-{}",
-                    self.draft_counter.fetch_add(1, Ordering::Relaxed)
-                );
+                let draft_id =
+                    DraftKind::Streaming.handle(self.draft_counter.fetch_add(1, Ordering::Relaxed));
                 {
                     let mut drafts = self.draft_streams.lock();
                     // Teams allows one streaming response per chat at a time,
@@ -1730,10 +1787,8 @@ impl Channel for MsTeamsChannel {
                 Ok(Some(draft_id))
             }
             StreamMode::MultiMessage => {
-                let draft_id = format!(
-                    "multi-{}",
-                    self.draft_counter.fetch_add(1, Ordering::Relaxed)
-                );
+                let draft_id = DraftKind::MultiMessage
+                    .handle(self.draft_counter.fetch_add(1, Ordering::Relaxed));
                 self.multi_message.lock().insert(
                     draft_id.clone(),
                     MultiMessageState {
@@ -1755,7 +1810,7 @@ impl Channel for MsTeamsChannel {
         if text.trim().is_empty() {
             return Ok(());
         }
-        if self.stream_mode() == StreamMode::MultiMessage {
+        if DraftKind::of(message_id) == DraftKind::MultiMessage {
             self.flush_multi_message_paragraphs(message_id, recipient, text)
                 .await;
             return Ok(());
@@ -1815,10 +1870,10 @@ impl Channel for MsTeamsChannel {
         message_id: &str,
         text: &str,
     ) -> Result<()> {
-        // Status lines belong to the native streaming bubble; in
-        // `multi_message` mode there is no bubble, and delivering them as
+        // Status lines belong to the native streaming bubble; a
+        // `multi_message` draft has no bubble, and delivering them as
         // standalone messages would spam the conversation, so skip them.
-        if self.stream_mode() == StreamMode::MultiMessage {
+        if DraftKind::of(message_id) == DraftKind::MultiMessage {
             return Ok(());
         }
         let Some(cfg) = self.config() else {
@@ -1873,7 +1928,7 @@ impl Channel for MsTeamsChannel {
         text: &str,
         _suppress_voice: bool,
     ) -> Result<()> {
-        if self.stream_mode() == StreamMode::MultiMessage {
+        if DraftKind::of(message_id) == DraftKind::MultiMessage {
             return self
                 .finalize_multi_message(message_id, recipient, text)
                 .await;
@@ -1944,7 +1999,7 @@ impl Channel for MsTeamsChannel {
     /// delivered (Teams cannot recall them), so cancel just drops this
     /// draft's state. Other turns in the same conversation keep theirs.
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> Result<()> {
-        if self.stream_mode() == StreamMode::MultiMessage {
+        if DraftKind::of(message_id) == DraftKind::MultiMessage {
             self.multi_message.lock().remove(message_id);
             return Ok(());
         }
@@ -2138,6 +2193,34 @@ mod tests {
                 .contains("requires `app_id` and `tenant_id`")
         );
         assert!(!ch.health_check().await);
+    }
+
+    /// Ids alone are not a usable configuration: inbound activities would
+    /// authenticate and every reply would then fail at the Entra token
+    /// exchange, so an enabled channel with no secret is refused at startup
+    /// rather than binding and reporting itself ready.
+    #[tokio::test]
+    async fn listen_requires_the_app_secret() {
+        let ch = MsTeamsChannel::new(
+            "default",
+            Arc::new(|| {
+                Some(MSTeamsConfig {
+                    app_password: String::new(),
+                    ..test_config()
+                })
+            }),
+            Arc::new(Vec::new),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let err = ch.listen(tx).await.unwrap_err();
+        assert!(
+            err.to_string().contains("requires `app_password`"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !ch.health_check().await,
+            "a channel that refused to start must not report ready"
+        );
     }
 
     #[tokio::test]
@@ -2637,6 +2720,24 @@ mod tests {
             Arc::new(Vec::new),
         )
         .with_token_url(format!("{}/token", connector.uri()))
+    }
+
+    /// A channel whose config block can be replaced while a draft is in
+    /// flight, modelling a `config.toml` reload mid-turn. The returned
+    /// handle is what the resolver reads, so a write to it is visible to
+    /// the next callback exactly as a reload would be.
+    fn reloadable_draft_channel(
+        config: MSTeamsConfig,
+        connector: &MockServer,
+    ) -> (MsTeamsChannel, Arc<parking_lot::Mutex<MSTeamsConfig>>) {
+        let live = Arc::new(parking_lot::Mutex::new(config));
+        let resolver = {
+            let live = Arc::clone(&live);
+            Arc::new(move || Some(live.lock().clone()))
+        };
+        let ch = MsTeamsChannel::new("default", resolver, Arc::new(Vec::new))
+            .with_token_url(format!("{}/token", connector.uri()));
+        (ch, live)
     }
 
     fn record_reference(ch: &MsTeamsChannel, connector: &MockServer, id: &str, kind: &str) {
@@ -3547,6 +3648,159 @@ mod tests {
                 body["text"].as_str().unwrap_or_default().to_string()
             })
             .collect()
+    }
+
+    /// `(type, streamType, text)` for every activity POSTed to `path`,
+    /// reading `streamType` out of the `streaminfo` entity that carries it.
+    /// The first two fields tell a native-streaming frame apart from an
+    /// ordinary message, which the mode-transition tests turn on.
+    fn activity_shapes_for_path(
+        requests: &[wiremock::Request],
+        path: &str,
+    ) -> Vec<(String, String, String)> {
+        requests
+            .iter()
+            .filter(|request| request.url.path() == path)
+            .map(|request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                (
+                    body["type"].as_str().unwrap_or_default().to_string(),
+                    body["entities"][0]["streamType"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    body["text"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// `stream_mode` is live config, so an operator editing `config.toml`
+    /// mid-turn flips it under a draft that is already open. A draft
+    /// registered as native streaming has to stay on that lifecycle: the
+    /// paragraph tables never held this handle, so finalizing through them
+    /// would find no entry and deliver nothing at all.
+    #[tokio::test]
+    async fn a_reload_into_multi_message_still_finalizes_a_streaming_draft() {
+        const CONVERSATION: &str = "a:1conv";
+        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
+
+        let connector = MockServer::start().await;
+        mock_token_endpoint(&connector).await;
+        Mock::given(method("POST"))
+            .and(path(ACTIVITIES))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
+            )
+            .mount(&connector)
+            .await;
+
+        let (ch, live) = reloadable_draft_channel(
+            MSTeamsConfig {
+                stream_mode: StreamMode::Partial,
+                draft_update_interval_ms: 0,
+                ..test_config()
+            },
+            &connector,
+        );
+        record_reference(&ch, &connector, CONVERSATION, "personal");
+
+        let draft = ch
+            .send_draft(&SendMessage::new("", CONVERSATION))
+            .await
+            .unwrap()
+            .unwrap();
+        // The reload lands after the handle was issued, before any delta.
+        live.lock().stream_mode = StreamMode::MultiMessage;
+
+        ch.update_draft(CONVERSATION, &draft, "First part.")
+            .await
+            .unwrap();
+        ch.finalize_draft(CONVERSATION, &draft, "First part.\n\nAll done.", false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            activity_shapes_for_path(&connector.received_requests().await.unwrap(), ACTIVITIES),
+            vec![
+                (
+                    "typing".to_string(),
+                    "streaming".to_string(),
+                    "First part.".to_string()
+                ),
+                (
+                    "message".to_string(),
+                    "final".to_string(),
+                    "First part.\n\nAll done.".to_string()
+                ),
+            ],
+            "the draft must keep streaming and close on its own bubble"
+        );
+        assert!(
+            ch.multi_message.lock().is_empty(),
+            "no paragraph state belongs to a streaming handle"
+        );
+        assert!(
+            ch.draft_streams.lock().is_empty(),
+            "finalize must drop the draft's stream state"
+        );
+    }
+
+    /// The mirror case, for both modes a reload can leave: a
+    /// paragraph-split draft must not be handed to the streaming path,
+    /// which has no record of the paragraphs already delivered and would
+    /// send the whole answer again on top of them.
+    #[tokio::test]
+    async fn a_reload_out_of_multi_message_does_not_resend_delivered_paragraphs() {
+        const CONVERSATION: &str = "a:1conv";
+        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
+
+        for flipped_to in [StreamMode::Partial, StreamMode::Off] {
+            let connector = MockServer::start().await;
+            mock_token_endpoint(&connector).await;
+            Mock::given(method("POST"))
+                .and(path(ACTIVITIES))
+                .respond_with(
+                    ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "m" })),
+                )
+                .mount(&connector)
+                .await;
+
+            let (ch, live) = reloadable_draft_channel(
+                MSTeamsConfig {
+                    stream_mode: StreamMode::MultiMessage,
+                    multi_message_delay_ms: 0,
+                    ..test_config()
+                },
+                &connector,
+            );
+            record_reference(&ch, &connector, CONVERSATION, "personal");
+
+            let draft = ch
+                .send_draft(&SendMessage::new("", CONVERSATION))
+                .await
+                .unwrap()
+                .unwrap();
+            ch.update_draft(CONVERSATION, &draft, "One.\n\nTwo.\n\n")
+                .await
+                .unwrap();
+
+            live.lock().stream_mode = flipped_to;
+
+            ch.finalize_draft(CONVERSATION, &draft, "One.\n\nTwo.\n\nThree.", false)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                activity_texts_for_path(&connector.received_requests().await.unwrap(), ACTIVITIES),
+                vec!["One.".to_string(), "Two.".to_string(), "Three.".to_string()],
+                "a reload to {flipped_to:?} must deliver only what is still owed"
+            );
+            assert!(
+                ch.multi_message.lock().is_empty(),
+                "finalize must drop the draft's paragraph state"
+            );
+        }
     }
 
     /// Two turns in one team channel share a reply target: the

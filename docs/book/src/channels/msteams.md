@@ -33,16 +33,28 @@ Matching is case-insensitive.
 
 1. Create the Azure Bot + app registration and note the **App ID**, **client
    secret**, and **Tenant ID** (see [Setup](#setup)).
-2. Add the blocks below to `config.toml` (channel + peer group + agent bind).
-3. Point a public HTTPS domain (reverse proxy, tunnel, etc.) at the listener
+2. Open zerocode's [Config pane](../zerocode/config.md) and fill in the Teams
+   channel: `enabled`, `app_id`, `app_password`, `tenant_id`, and `port`. Each
+   field carries its own description and validation there, and the secret is
+   handled as one rather than typed into a file.
+3. In the same pane, add the peer group that says who may talk to the bot and
+   bind the channel to an agent. An empty allowlist **denies everyone**, so
+   this step is required rather than optional.
+4. Point a public HTTPS domain (reverse proxy, tunnel, etc.) at the listener
    port and register `https://<domain>/api/messages` as the bot's **messaging
    endpoint** in Azure. With Docker Compose, publish host port `3978` to the
    container's `port`.
-4. Restart the daemon (`docker compose restart zeroclaw` or equivalent) and
-   confirm `zeroclaw status` shows Microsoft Teams as configured.
-5. DM the bot or @-mention it in a team channel.
+5. Restart the daemon so the listener binds on its port (`docker compose
+   restart zeroclaw` or equivalent) and confirm `zeroclaw status` shows
+   Microsoft Teams as configured.
+6. DM the bot or @-mention it in a team channel.
 
-## Example `config.toml`
+## What the settings persist to
+
+The blocks below are what the Config pane writes, shown so you can see the
+result of a given control. Editing them by hand is the fallback for headless
+hosts and scripted provisioning; it takes a daemon restart to apply, and the
+secret then lives in whatever wrote the file.
 
 Three pieces are required. An empty peer-group allowlist **denies everyone**,
 so the channel alone is not enough.
@@ -82,9 +94,9 @@ Find a user's Object ID under **Microsoft Entra ID → Users → (user) → Obje
 ID**. The channel also accepts the Teams-scoped `29:…` id, but that value is
 less stable across conversations.
 
-After editing, reload/restart so the daemon picks up the new blocks. Docker
-Compose examples already expose `3978` for the activity listener; the gateway
-dashboard port (`42617`) is separate.
+A hand-edited file needs a reload/restart before the daemon picks up the new
+blocks. Docker Compose examples already expose `3978` for the activity
+listener; the gateway dashboard port (`42617`) is separate.
 
 ## Configuration
 
@@ -98,6 +110,12 @@ dashboard port (`42617`) is separate.
 
 Multiple aliases (`[channels.msteams.<alias>]`) each run their own listener
 and must use distinct ports.
+
+An enabled channel missing `app_id`, `tenant_id`, or `app_password` refuses to
+start and names the field in the daemon log. All three are load-bearing: the
+first two authenticate inbound activities, and Entra mints every outbound
+Connector token from the secret, so a channel without it would bind and report
+itself ready while every reply failed.
 
 ## Inbound authentication
 

@@ -377,7 +377,7 @@ crates/zeroclaw-channels/src/msteams/
 | Method | Behavior |
 | --- | --- |
 | `name()` | `"msteams"` |
-| `listen()` | axum server on `0.0.0.0:{port}`, route `POST {path}` |
+| `listen()` | axum server on `0.0.0.0:{port}`, route `POST {path}`. Refuses to start when `app_id`, `tenant_id`, or `app_password` is empty: the first two authenticate inbound activities, and Entra mints every Connector token from the secret, so a channel missing any of them would bind, report itself ready, and fail one reply at a time instead of once at startup |
 | `send()` | proactive Connector API POST |
 | `self_handle()` | bot id from `activity.recipient.id` (set on first inbound) — self-loop guard |
 | `self_addressed_mention()` | `<at>BotName</at>` form for the per-channel system prompt |
@@ -395,6 +395,19 @@ crates/zeroclaw-channels/src/msteams/
 | `start_typing()` | one-shot `typing` activity (no `streaminfo` entity). Carries the visual feedback in group chats, where no draft bubble is available. Skipped in team channels, which have no indicator to show (see below) |
 | `stop_typing()` | no-op — Teams' typing indicator expires on its own |
 | everything else | trait defaults (deferred) |
+
+The mode each `*_draft` row names is the one that draft's **handle** was issued
+with, not whatever `stream_mode` reads at the time of the call. `stream_mode` is
+live config, so an operator editing it mid-turn flips it under an open draft.
+`send_draft` stamps the lifecycle into the handle it returns (`draft-…` or
+`multi-…`) and every later callback dispatches on that. Re-reading the current
+mode instead breaks both transitions: a flip into `multi_message` would finalize
+a native-streaming draft through paragraph state that never held its handle and
+deliver nothing at all, and a flip out of it would hand a paragraph-split draft
+to the streaming path, which has no record of the paragraphs already sent and
+would repeat the whole answer under them. Values that are genuinely live stay
+live: credentials, `draft_update_interval_ms`, and `multi_message_delay_ms` are
+all resolved from current config on every call.
 
 ### Streaming protocol detail (the gray "thinking" message)
 
@@ -679,6 +692,7 @@ Pre-edit ritual answers for every state-bearing field:
 | ConversationReference map | Source of truth is **created here** (delivered by Teams per activity; exists nowhere else in the codebase). In-memory `RwLock<HashMap<String, ConversationReference>>`. |
 | `bot_identity` (id/name) | Source of truth is the platform (first inbound `activity.recipient`). `OnceCell`, same as `mattermost.rs::bot_identity`. |
 | Draft stream state (`streamId`, `streamSequence` per in-flight draft) | Source of truth is **created here** (assigned by Teams / incremented locally per protocol). Ephemeral per-draft map, removed on finalize/cancel. |
+| Draft lifecycle kind (which delivery path owns a handle) | Source of truth is **created here**, and carried by the draft handle itself (`draft-…` for native streaming, `multi-…` for paragraph delivery) rather than by a parallel map. `stream_mode` is live config, so a reload can flip it while a turn is in flight; the callbacks after `send_draft` therefore must not re-derive the path from it. Encoding the kind in the handle keeps the fact with the thing it describes, needs no extra state to stay in sync, and survives the teardown of the state the draft was created with. |
 | `multi_message` per-draft state (delivered prefix, `thread_ts`) | Source of truth is **created here** (which part of an in-flight response has already been delivered; exists nowhere else). Ephemeral map keyed by the draft handle, since one conversation can have concurrent turns; dropped on finalize/cancel. The prefix is kept verbatim rather than as an offset, because finalize is handed a text sanitized on a path the streamed one never took, and it grows only after a paragraph's send lands. `thread_ts` is *borrowed* from the triggering message rather than re-derived, and the recipient is resolved from the caller's argument rather than stored a second time. |
 
 ## 8. Testing plan
