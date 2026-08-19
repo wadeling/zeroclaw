@@ -95,8 +95,35 @@ ID**. The channel also accepts the Teams-scoped `29:…` id, but that value is
 less stable across conversations.
 
 A hand-edited file needs a reload/restart before the daemon picks up the new
-blocks. Docker Compose examples already expose `3978` for the activity
-listener; the gateway dashboard port (`42617`) is separate.
+blocks.
+
+### Docker Compose
+
+The shipped `docker-compose.yml` needs two changes for Teams. Its image does not
+carry `channel-msteams`, and it publishes the gateway port only:
+
+```yaml
+services:
+  zeroclaw:
+    # Replaces the `image:` line: no published tag carries the Teams channel,
+    # so the binary is built here with the feature added to the default set.
+    build:
+      context: .
+      args:
+        ZEROCLAW_CARGO_FLAGS: >-
+          --no-default-features
+          --features acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-lark,channel-matrix,channel-msteams,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export,whatsapp-web
+    ports:
+      # Gateway dashboard, unchanged.
+      - "${HOST_PORT:-127.0.0.1:42617}:${ZEROCLAW_GATEWAY_PORT:-42617}"
+      # The activity listener, matching `port` in the channel block. Keep it on
+      # loopback and terminate TLS in your own reverse proxy: Azure requires an
+      # HTTPS messaging endpoint, and this listener speaks plain HTTP.
+      - "127.0.0.1:3978:3978"
+```
+
+The two ports serve different things: the gateway answers dashboard and API
+traffic, and this one receives Bot Framework activities.
 
 ## Configuration
 
@@ -194,8 +221,7 @@ The same thing happens to any turn that takes longer than two minutes, which is
 Teams' hard limit on a streaming session. Teams stops the bubble at that point
 and labels it "this response was stopped"; the answer then arrives as an
 ordinary message once the agent finishes, and the stopped bubble is removed.
-Expect this on turns with slow tools, and use `stream_mode = "multi_message"`
-instead if you would rather see partial output on long turns.
+Expect this on turns with slow tools.
 
 Removing a bubble takes two steps, because Teams only ends a streaming
 response when the bot sends its closing message: the bubble is closed first
@@ -204,16 +230,16 @@ what stays in the conversation is a short line saying the response was
 superseded, rather than a bubble frozen mid-answer whose Stop button no longer
 works.
 
-`stream_mode = "multi_message"` sends the response as separate messages split
-on paragraph boundaries instead, in every conversation type (personal, group,
-and team channels). `multi_message_delay_ms` (default 800 ms) paces the sends.
-A section separator such as `---` is not sent as a message of its own, since
-Teams draws no horizontal rule and it would arrive as an empty bubble; the
-message boundary separates the sections instead.
-Group chats show the ordinary typing indicator while the turn runs, regardless
-of `stream_mode`. Team channels show no indicator at any setting, so a long turn
-there is silent until the first message arrives; `multi_message` is the way to
-get visible progress in a channel.
+`stream_mode = "multi_message"` is **not supported on Teams**. Setting it logs a
+warning at startup and behaves as `off`: paragraph delivery would publish each
+paragraph as a permanent message drawn from mid-turn draft text, which the
+outbound credential-redaction pass does not cover, and Teams cannot recall a
+message once sent. That draft boundary is shared with Discord and Matrix and is
+being addressed there; until it is, Teams offers `off` and `partial` only.
+
+Group chats show the ordinary typing indicator while the turn runs, at any
+setting. Team channels show no indicator at all, because Teams has none in a
+channel for anyone, so a long turn there is silent until the reply arrives.
 
 `interrupt_on_new_message` is resolved from the `default` alias and applied to
 every `msteams` alias: a value set only on a non-`default` alias is not honored,
@@ -224,9 +250,8 @@ and enabling it on `default` turns it on for all Teams conversations.
 Teams rejects any single activity larger than ~100 KB with a `413`
 (`MessageSizeTooBig`). Outbound replies that exceed a conservative size budget
 are split into ordered chunks, preferring paragraph, then line, then word
-boundaries, so a long response is delivered in full rather than dropped. This
-applies to every `stream_mode` (including each `multi_message` paragraph); a
-reply that fits the budget is sent unchanged as a single message.
+boundaries, so a long response is delivered in full rather than dropped. A reply
+that fits the budget is sent unchanged as a single message.
 
 Streaming is held to the same ceiling, and a stream cannot be split, since
 every update has to contain the text before it and the bubble closes with a
@@ -248,11 +273,8 @@ connects to the endpoint you registered rather than the other way round.
 Teams allows a bot 7 sends per second in one conversation, with tighter budgets
 over longer windows (8 per 2 seconds, 60 per 30 seconds, 1800 per hour). That is
 separate from the 1 request per second its streaming API allows. Pacing is
-handled for you: `multi_message` paragraphs are spaced by
-`multi_message_delay_ms`, and the chunks of a split reply are spaced 500 ms
-apart so a long answer cannot trip a window on its own. Setting
-`multi_message_delay_ms = 0` turns that pacing off and can produce `429`s on
-long replies.
+handled for you: the chunks of a split reply are spaced 500 ms apart, so a long
+answer cannot trip a window on its own.
 
 If Teams does throttle an ordinary reply, it is retried a few times, honoring
 the service's `Retry-After` hint, so a brief burst is waited out instead of
