@@ -175,12 +175,16 @@ pub fn split_conversation_id(raw: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Unwrap `<at>…</at>` mention tags to their inner display name,
-/// collapsing surrounding whitespace. Teams inserts these tags around
-/// every @mention; unwrapping (rather than deleting) keeps the mentioned
-/// user's name in the text, so a prompt like `@Bot ask @Alice` still
-/// carries "Alice" to the model. The bot's own mention is removed
-/// upstream by [`clean_message_text`] before this runs.
+/// Unwrap `<at>…</at>` mention tags to their inner display name. Teams
+/// inserts these tags around every @mention; unwrapping (rather than
+/// deleting) keeps the mentioned user's name in the text, so a prompt like
+/// `@Bot ask @Alice` still carries "Alice" to the model. The bot's own
+/// mention is removed upstream by [`clean_message_text`] before this runs.
+///
+/// Whitespace outside the tags is left exactly as the author typed it. A
+/// Teams message carries real line structure — a multi-line prompt, a list,
+/// a pasted block — and normalizing it here would flatten every message,
+/// mention or not, into one line before the model ever sees it.
 #[must_use]
 pub fn unwrap_mention_tags(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -204,7 +208,46 @@ pub fn unwrap_mention_tags(text: &str) -> String {
         }
     }
     out.push_str(rest);
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    out
+}
+
+/// Remove every occurrence of `literal`, closing the seam it leaves behind
+/// without touching whitespace anywhere else.
+///
+/// A removed bot mention sits between text the author wrote, so dropping it
+/// outright would either fuse two words (`@Bot report` ⇒ `report` is right,
+/// but `run @Bot now` ⇒ `runnow` is not) or leave the double space of the
+/// space that preceded it plus the one that followed. Only the horizontal
+/// whitespace immediately around the removal is rewritten: to a single space
+/// between words, to nothing when the mention sat at the start or end of its
+/// line. Line breaks and indentation survive, here and everywhere else.
+fn remove_literal_closing_gap(text: &str, literal: &str) -> String {
+    if literal.is_empty() || !text.contains(literal) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(literal) {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + literal.len()..];
+        while out.ends_with([' ', '\t']) {
+            out.pop();
+        }
+        let tail = rest.trim_start_matches([' ', '\t']);
+        // Nothing to join across at a line boundary: the words the mention
+        // separated are on different lines, or there is no word on one side.
+        let joins_words = !(out.is_empty()
+            || out.ends_with('\n')
+            || tail.is_empty()
+            || tail.starts_with('\n')
+            || tail.starts_with('\r'));
+        if joins_words {
+            out.push(' ');
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Decode the HTML entities Teams substitutes into plain-text message
@@ -263,13 +306,12 @@ pub fn decode_html_entities(text: &str) -> String {
 pub fn clean_message_text(text: &str, bot_mention_literals: &[String]) -> String {
     let mut without_bot = text.to_string();
     for literal in bot_mention_literals {
-        if !literal.is_empty() {
-            // Replace with a space so adjacent words don't fuse; the
-            // whitespace collapse in `unwrap_mention_tags` tidies up.
-            without_bot = without_bot.replace(literal.as_str(), " ");
-        }
+        without_bot = remove_literal_closing_gap(&without_bot, literal);
     }
-    decode_html_entities(&unwrap_mention_tags(&without_bot))
+    // The addressing that led here, "@Bot" on its own line above the
+    // request, is not part of the request; the blank line it leaves is
+    // trimmed off the ends while the body keeps its own shape.
+    decode_html_entities(unwrap_mention_tags(&without_bot).trim())
 }
 
 #[cfg(test)]
@@ -416,6 +458,62 @@ mod tests {
         assert_eq!(
             clean_message_text("<at>Alice</at> and <at>Bob</at>", &[]),
             "Alice and Bob"
+        );
+    }
+
+    /// A Teams message carries the line structure its author typed, and the
+    /// model is the reader: a numbered list, an indented block or a pasted
+    /// snippet has to arrive with its breaks intact whether or not the
+    /// message mentions the bot.
+    #[test]
+    fn cleanup_preserves_the_line_structure_of_the_message() {
+        let prompt = "Review this:\n\n1. first item\n2. second item\n\n    indented code\n\nThanks";
+        assert_eq!(clean_message_text(prompt, &[]), prompt);
+        assert_eq!(
+            clean_message_text(
+                &format!("<at>ZeroClaw</at> {prompt}"),
+                &["<at>ZeroClaw</at>".to_string()]
+            ),
+            prompt,
+            "removing the bot mention must not reflow the rest"
+        );
+        // The mention on its own line above the request: the request keeps
+        // its shape and loses only the blank line the mention left.
+        assert_eq!(
+            clean_message_text(
+                "<at>ZeroClaw</at>\nline one\nline two",
+                &["<at>ZeroClaw</at>".to_string()]
+            ),
+            "line one\nline two"
+        );
+    }
+
+    /// The seam the removed mention leaves: neither fused words nor a double
+    /// space, wherever in the line it sat.
+    #[test]
+    fn removing_the_bot_mention_closes_its_gap() {
+        let bot = ["<at>ZeroClaw</at>".to_string()];
+        assert_eq!(
+            clean_message_text("run <at>ZeroClaw</at> now", &bot),
+            "run now"
+        );
+        assert_eq!(
+            clean_message_text("run  <at>ZeroClaw</at>  now", &bot),
+            "run now"
+        );
+        assert_eq!(
+            clean_message_text("run<at>ZeroClaw</at>now", &bot),
+            "run now"
+        );
+        assert_eq!(
+            clean_message_text("first <at>ZeroClaw</at>\nsecond", &bot),
+            "first\nsecond",
+            "a mention at the end of a line must not pull the next line up"
+        );
+        // Teams repeats the literal when the author mentions the bot twice.
+        assert_eq!(
+            clean_message_text("<at>ZeroClaw</at> ping <at>ZeroClaw</at> again", &bot),
+            "ping again"
         );
     }
 
