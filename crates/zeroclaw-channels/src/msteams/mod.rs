@@ -76,55 +76,6 @@ struct SendContext {
     token: String,
 }
 
-/// Which delivery lifecycle a draft handle was issued for. Source of
-/// truth created here, carried by the handle itself.
-///
-/// `stream_mode` is live config, re-resolved on every call, so a reload
-/// can flip it while a turn is in flight. The callbacks that follow
-/// [`MsTeamsChannel::send_draft`] therefore must not ask the current mode
-/// which implementation owns a draft: after a flip to `multi_message` they
-/// would finalize a native stream through paragraph state that never held
-/// it and deliver nothing, and after a flip away from it they would hand a
-/// paragraph-split draft to the streaming path, which has no record of what
-/// was already sent and would repeat the whole answer. Reading the kind off
-/// the handle keeps every callback on the lifecycle that created its state.
-/// Genuinely live values, credentials and pacing intervals, keep coming
-/// from current config.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum DraftKind {
-    /// Teams native streaming: one bubble, re-sent frame by frame.
-    Streaming,
-    /// Paragraph-split delivery: each completed paragraph its own message.
-    MultiMessage,
-}
-
-impl DraftKind {
-    /// The handle prefix that marks this lifecycle.
-    const fn prefix(self) -> &'static str {
-        match self {
-            Self::Streaming => "draft-",
-            Self::MultiMessage => "multi-",
-        }
-    }
-
-    /// A fresh handle of this kind.
-    fn handle(self, serial: u64) -> String {
-        format!("{}{serial}", self.prefix())
-    }
-
-    /// The lifecycle a handle was issued for. Anything else takes the
-    /// streaming path, which falls back to a plain send when it finds no
-    /// draft state, so an unrecognized handle still delivers its answer
-    /// rather than dropping it.
-    fn of(handle: &str) -> Self {
-        if handle.starts_with(Self::MultiMessage.prefix()) {
-            Self::MultiMessage
-        } else {
-            Self::Streaming
-        }
-    }
-}
-
 /// Per-draft native-streaming state. Source of truth created here: the
 /// streaminfo sequence counter and the Teams-assigned `streamId` exist
 /// nowhere else and are dropped on finalize/cancel.
@@ -171,41 +122,6 @@ struct OpenedStream {
     streamed: String,
 }
 
-/// Per-draft `multi_message` streaming state. Source of truth created
-/// here: which part of the accumulated response has already been flushed
-/// as separate messages, and the thread anchor replies address. Dropped on
-/// finalize/cancel.
-///
-/// Keyed by the draft handle rather than the recipient because one Teams
-/// conversation can have several turns in flight at once: two people in a
-/// group chat, two threads of one team channel (the `;messageid=` suffix is
-/// stripped from the reply target, so threads share it), or a follow-up
-/// that arrives while the previous answer is still streaming. Sharing one
-/// entry across those would let a turn deliver its paragraphs into another
-/// turn's thread, and let either one's finalize/cancel drop the other's
-/// progress.
-///
-/// One mutex covers the whole map, and that, rather than any same-draft
-/// race, is what the locking in the flush path is for: concurrent turns
-/// reach different keys, but a `HashMap` still cannot be mutated from two
-/// tasks at once. Two calls against the *same* key never overlap today,
-/// because the orchestrator feeds one draft from a single delta-consumer
-/// task and awaits that task before it finalizes or cancels. That ordering
-/// belongs to the orchestrator rather than to the `Channel` contract, so
-/// the flush path still verifies that its entry is present and its offset
-/// unmoved instead of assuming it.
-struct MultiMessageState {
-    /// The prefix of the accumulated response already delivered as its own
-    /// messages, kept verbatim rather than as a byte offset. Finalize is
-    /// handed a text sanitized on a path the streamed one never took, so an
-    /// offset measured against the stream does not address it; see
-    /// [`undelivered_tail`].
-    sent: String,
-    /// Thread anchor (`thread_ts`) carried from the triggering message so
-    /// team-channel paragraphs stay in-thread.
-    thread_ts: Option<String>,
-}
-
 /// A `typing`/`message` activity carrying a Teams `streaminfo` entity
 /// (the native streaming protocol; design §4).
 fn streaming_activity_body(
@@ -230,109 +146,6 @@ fn streaming_activity_body(
         "text": text,
         "entities": [entity],
     })
-}
-
-/// Find the first paragraph break (a blank line, `\n\n`) that is not
-/// inside a fenced code block, for `multi_message` splitting. Returns the
-/// trimmed paragraph text before the break and the number of bytes
-/// consumed (the paragraph plus its trailing blank line). `None` when no
-/// complete paragraph boundary has arrived yet, so the caller waits for
-/// more streamed text rather than splitting mid-paragraph or mid-fence.
-fn next_paragraph_boundary(text: &str) -> Option<(String, usize)> {
-    let bytes = text.as_bytes();
-    let mut in_fence = false;
-    let mut pos = 0;
-    while pos < bytes.len() {
-        let ch = bytes[pos];
-        if ch == b'`'
-            && pos + 2 < bytes.len()
-            && bytes[pos + 1] == b'`'
-            && bytes[pos + 2] == b'`'
-            && (pos == 0 || bytes[pos - 1] == b'\n')
-        {
-            in_fence = !in_fence;
-        }
-        if !in_fence && ch == b'\n' && pos + 1 < bytes.len() && bytes[pos + 1] == b'\n' {
-            return Some((text[..pos].trim().to_string(), pos + 2));
-        }
-        pos += 1;
-    }
-    None
-}
-
-/// The part of `text` that the messages recorded in `sent` have not
-/// delivered, trimmed and ready to send (empty when nothing is owed).
-///
-/// The two arguments come from different places. `sent` was published from the
-/// streamed text, which the orchestrator only strips `<think>` blocks out of;
-/// `text` is the finalized answer, which also had tool-call tags, tool
-/// narration and protocol artifacts removed and credentials redacted. So the
-/// pair is usually identical but need not be, and cutting `text` at
-/// `sent.len()` handles that badly: a shorter `text` (sanitizing removed
-/// something, or simply trimmed the trailing blank line the last paragraph
-/// consumed) leaves the offset past the end, and a `text` that lost bytes
-/// before the offset shifts every later byte.
-///
-/// The common prefix is what actually reached the conversation, so what
-/// follows it is what is still owed. An identical pair yields exactly the tail
-/// after the last flushed paragraph, and a divergent one delivers the
-/// sanitized remainder without repeating the paragraphs already sent.
-fn undelivered_tail(text: &str, sent: &str) -> String {
-    let mut shared = 0;
-    for (a, b) in text.chars().zip(sent.chars()) {
-        if a != b {
-            break;
-        }
-        shared += a.len_utf8();
-    }
-    let tail = text[shared..].trim();
-    // When the divergence sits *inside* the delivered region — a tool-call
-    // envelope between two paragraphs is the everyday case — the prefix stops
-    // there, so the tail restates whatever followed it, which may already be
-    // in the conversation. The record holds those paragraphs verbatim, so an
-    // ending that is already the end of what went out is owed to no one.
-    if sent.trim_end().ends_with(tail) {
-        return String::new();
-    }
-    tail.to_string()
-}
-
-/// Is `text` nothing but thematic breaks (and blank lines)?
-///
-/// Teams' message markdown has no horizontal rule, so a message whose entire
-/// body is one arrives as an empty bubble. `multi_message` makes every
-/// paragraph a message, and a model asked to separate sections emits these
-/// freely: one live turn put seven of them among twenty-three paragraphs, so a
-/// third of that answer was blank bubbles. Within a larger message the break
-/// is merely dropped and the text still reads, which is why only a message
-/// that is nothing else is withheld.
-///
-/// Follows CommonMark: three or more matching `-`, `*` or `_`, spaces and tabs
-/// allowed between them and nothing else on the line.
-fn renders_as_nothing(text: &str) -> bool {
-    let mut saw_break = false;
-    for line in text.lines() {
-        let line = line.trim();
-        let Some(marker) = line.chars().next() else {
-            continue;
-        };
-        if !matches!(marker, '-' | '*' | '_') {
-            return false;
-        }
-        let mut markers = 0;
-        for ch in line.chars() {
-            if ch == marker {
-                markers += 1;
-            } else if ch != ' ' && ch != '\t' {
-                return false;
-            }
-        }
-        if markers < 3 {
-            return false;
-        }
-        saw_break = true;
-    }
-    saw_break
 }
 
 /// Per-message size ceiling for outbound Teams activities, in characters.
@@ -465,8 +278,8 @@ enum ThrottlePolicy {
 /// Ceiling on a single backoff wait, including a `Retry-After` Teams asks
 /// for.
 ///
-/// Every retrying request is a send outside a stream (plain replies,
-/// `multi_message` paragraphs, split chunks), so one deadline covers them all:
+/// Every retrying request is a send outside a stream (plain replies, split
+/// chunks), so one deadline covers them all:
 /// the per-turn budget, `channels.message_timeout_secs`, 300s by default.
 /// Requests that carry a `streamId` never reach this ceiling; the two-minute
 /// session limit makes a stream that has begun refusing requests a lost cause,
@@ -565,9 +378,6 @@ pub struct MsTeamsChannel {
     /// `draft_update_interval_ms` floor (Teams rate-limits streaming
     /// updates to roughly one per second).
     last_draft_update: parking_lot::Mutex<HashMap<String, Instant>>,
-    /// `multi_message` progress per draft handle (see
-    /// [`MultiMessageState`]).
-    multi_message: parking_lot::Mutex<HashMap<String, MultiMessageState>>,
     #[cfg(test)]
     token_url_override: Option<String>,
 }
@@ -595,7 +405,6 @@ impl MsTeamsChannel {
             draft_streams: parking_lot::Mutex::new(HashMap::new()),
             draft_counter: AtomicU64::new(0),
             last_draft_update: parking_lot::Mutex::new(HashMap::new()),
-            multi_message: parking_lot::Mutex::new(HashMap::new()),
             #[cfg(test)]
             token_url_override: None,
         }
@@ -686,9 +495,23 @@ impl MsTeamsChannel {
         provider
     }
 
-    /// Current stream mode, resolved from canonical state.
+    /// Effective stream mode, resolved from canonical state.
+    ///
+    /// `multi_message` is not offered on Teams and reads as `off` here, the
+    /// same fallback Lark applies to it. Paragraph delivery publishes each
+    /// paragraph as a permanent message, and the draft boundary it would
+    /// publish from is the one the orchestrator does not run its outbound
+    /// leak policy over, so a credential in mid-answer text could reach a
+    /// message no later sanitized reply can edit or recall. That boundary is
+    /// shared with Discord and Matrix and is fixed there, not here.
+    /// [`Self::listen`] names the fallback in the operator's log once at
+    /// startup; clamping here rather than at startup also covers a config
+    /// reload into the mode.
     fn stream_mode(&self) -> StreamMode {
-        self.config().map(|cfg| cfg.stream_mode).unwrap_or_default()
+        match self.config().map(|cfg| cfg.stream_mode).unwrap_or_default() {
+            StreamMode::MultiMessage => StreamMode::Off,
+            other => other,
+        }
     }
 
     /// Resolve everything an outbound Connector call needs for
@@ -935,11 +758,8 @@ impl MsTeamsChannel {
             .insert(recipient.to_string(), Instant::now());
     }
 
-    /// Drop all local state for a native-streaming draft (finalized or
-    /// cancelled), returning the stream it leaves on screen if one ever
-    /// opened. Paragraph-split drafts are torn down by
-    /// [`Self::finalize_multi_message`] and `cancel_draft` instead; a
-    /// [`DraftKind::Streaming`] handle is never a key in that map.
+    /// Drop all local state for a draft (finalized or cancelled),
+    /// returning the stream it leaves on screen if one ever opened.
     fn clear_draft_state(&self, recipient: &str, draft_id: &str) -> Option<OpenedStream> {
         let removed = self.draft_streams.lock().remove(draft_id);
         // Only when this call is the one that owned the draft. The pacing map
@@ -948,9 +768,9 @@ impl MsTeamsChannel {
         // and again on the way out. The freed stream slot lets the next turn
         // in this chat open its own draft during that request, so a second,
         // draft-less clear would drop *its* interval floor and let its next
-        // frame go out early. A `DraftKind::Streaming` handle is registered
-        // by `send_draft` before it is ever handed out, so `removed` is
-        // `Some` exactly on the clear that owns one.
+        // frame go out early. `send_draft` registers a draft before it hands
+        // the handle out, so `removed` is `Some` exactly on the clear that
+        // owns one.
         if removed.is_some() {
             self.last_draft_update.lock().remove(recipient);
         }
@@ -960,122 +780,6 @@ impl MsTeamsChannel {
                 streamed: draft.streamed,
             })
         })
-    }
-
-    /// `multi_message` streaming: flush every paragraph of `text` that has
-    /// fully arrived (past this draft's sent offset) as its own Teams
-    /// message, pausing `multi_message_delay_ms` between sends.
-    ///
-    /// The offset is committed only once a send has succeeded, so a failed
-    /// paragraph stays pending and [`Self::finalize_multi_message`] carries
-    /// it forward. Flushing then stops rather than continuing past it:
-    /// advancing over a paragraph that never landed would deliver later
-    /// ones ahead of it and leave a hole in the response.
-    async fn flush_multi_message_paragraphs(&self, draft_id: &str, recipient: &str, text: &str) {
-        let delay_ms = self
-            .config()
-            .map(|cfg| cfg.multi_message_delay_ms)
-            .unwrap_or(0);
-        loop {
-            let (paragraph, thread_ts, delivered_len, consumed) = {
-                let mut state = self.multi_message.lock();
-                // Missing once the draft has been torn down: an abandoned
-                // turn whose `cancel_draft` already dropped its state, or a
-                // finalize that ran before this flush.
-                let Some(entry) = state.get_mut(draft_id) else {
-                    return;
-                };
-                // This text does not continue what was delivered, so nothing
-                // in it can be identified as the next paragraph. Finalize
-                // reaches this on every turn whose answer the sanitizers
-                // changed, since it flushes with the finalized text; it then
-                // sends what is still owed as one message
-                // ([`undelivered_tail`]). The record of what was delivered
-                // has to survive that, or the answer goes out twice.
-                if !text.starts_with(entry.sent.as_str()) {
-                    return;
-                }
-                let pending = &text[entry.sent.len()..];
-                let Some((paragraph, consumed)) = next_paragraph_boundary(pending) else {
-                    return;
-                };
-                if paragraph.is_empty() {
-                    // Blank paragraph (e.g. consecutive blank lines): there
-                    // is nothing to send, so it is consumed under this same
-                    // lock and the scan continues.
-                    entry.sent.push_str(&pending[..consumed]);
-                    continue;
-                }
-                (
-                    paragraph,
-                    entry.thread_ts.clone(),
-                    entry.sent.len(),
-                    pending[..consumed].to_string(),
-                )
-            };
-            let msg = SendMessage::new(&paragraph, recipient).in_thread(thread_ts);
-            if let Err(err) = self.send(&msg).await {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"error": format!("{err}")})),
-                    "Teams multi-message paragraph send failed"
-                );
-                return;
-            }
-            {
-                let mut state = self.multi_message.lock();
-                // Commit the paragraph that just landed. Both checks are
-                // expected to pass under the orchestrator's ordering, which
-                // keeps a same-draft finalize or cancel from interleaving
-                // with this send (see [`MultiMessageState`]). They hold the
-                // invariant at the trait boundary instead: a caller that did
-                // overlap two flushes must not be able to send one paragraph
-                // twice or record delivery of one that was skipped.
-                let Some(entry) = state.get_mut(draft_id) else {
-                    return;
-                };
-                if entry.sent.len() != delivered_len {
-                    return;
-                }
-                entry.sent.push_str(&consumed);
-            }
-            if delay_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-            }
-        }
-    }
-
-    /// `multi_message` finalize: flush any complete paragraphs, then send
-    /// whatever the flush could not deliver as a last message. Drops this
-    /// draft's state.
-    async fn finalize_multi_message(
-        &self,
-        draft_id: &str,
-        recipient: &str,
-        text: &str,
-    ) -> Result<()> {
-        self.flush_multi_message_paragraphs(draft_id, recipient, text)
-            .await;
-        let (remaining, thread_ts) = {
-            let mut state = self.multi_message.lock();
-            match state.remove(draft_id) {
-                // Everything the flushed messages did not deliver: the
-                // trailing paragraph, which has no closing blank line, plus
-                // any paragraph whose send failed, measured against this
-                // text rather than against the streamed one it was flushed
-                // from.
-                Some(entry) => (undelivered_tail(text, &entry.sent), entry.thread_ts),
-                // Already cancelled: an abandoned turn delivers nothing
-                // further.
-                None => (String::new(), None),
-            }
-        };
-        if !remaining.is_empty() {
-            let msg = SendMessage::new(&remaining, recipient).in_thread(thread_ts);
-            self.send(&msg).await?;
-        }
-        Ok(())
     }
 
     /// Deliver a native-streaming draft's final answer: the closing
@@ -1096,8 +800,9 @@ impl MsTeamsChannel {
         // turn — and neither would show anything: a partial draft only exists
         // in a personal chat, where Teams has no threads and renders a
         // `replyToId` reply as a plain message at the end of the conversation
-        // (visual threading is a channel-only feature). Channel threading runs
-        // through `multi_message`, whose state carries the anchor.
+        // (visual threading is a channel-only feature). A team-channel turn
+        // never opens a draft, so its threaded reply goes out through `send`,
+        // which does carry the anchor.
         let url = Self::activities_url(&ctx.reference, &ctx.base_id, None)?;
 
         let stream = self.clear_draft_state(recipient, draft_id);
@@ -1605,19 +1310,13 @@ impl Channel for MsTeamsChannel {
         // keep. The orchestrator strips envelopes from assistant text before
         // either a draft frame or a finalized reply, but nothing in the trait
         // obliges a caller to have run that pass, and this method also carries
-        // `multi_message` paragraphs, split chunks and the oversize-stream
-        // handoff. Stripping once here covers all of them.
+        // split chunks and the oversize-stream handoff. Stripping once here
+        // covers all of them.
         let content = crate::util::strip_tool_call_tags(&message.content);
         // A paragraph that was nothing but an envelope has nothing left to
         // say. Teams rejects an empty activity, and the caller wanted that
         // text delivered, not a blank message in its place.
         if content.trim().is_empty() && !message.content.trim().is_empty() {
-            return Ok(());
-        }
-        // Likewise for a section separator that became a message of its own,
-        // which Teams renders as an empty bubble. The message boundary already
-        // separates what the break was there to separate.
-        if renders_as_nothing(&content) {
             return Ok(());
         }
         let (_, ctx) = self.send_context(&message.recipient).await?;
@@ -1681,6 +1380,17 @@ impl Channel for MsTeamsChannel {
                 self.alias,
             );
         }
+        // Said once here rather than on every draft callback, where
+        // [`Self::stream_mode`] does the actual clamping.
+        if cfg.stream_mode == StreamMode::MultiMessage {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "msteams: stream_mode=multi_message is not supported; falling back to off (one \
+                 reply per turn). Use stream_mode=partial for the native streaming bubble in \
+                 personal chats."
+            );
+        }
 
         let path = if cfg.path.starts_with('/') {
             cfg.path.clone()
@@ -1734,8 +1444,8 @@ impl Channel for MsTeamsChannel {
     /// seconds, so the orchestrator re-invokes this on its refresh
     /// interval for the duration of the turn. Personal-chat native
     /// streaming renders its own gray bubble and the orchestrator
-    /// suppresses typing there; this covers group chats, non-streaming
-    /// (`off`) turns, and `multi_message`.
+    /// suppresses typing there; this covers group chats and non-streaming
+    /// (`off`) turns.
     async fn start_typing(&self, recipient: &str) -> Result<()> {
         // A team channel has no typing indicator, for a bot or for a human
         // author. The Connector still takes the activity — it answers 202 and
@@ -1781,44 +1491,22 @@ impl Channel for MsTeamsChannel {
     }
 
     fn supports_draft_updates_for(&self, message: &ChannelMessage) -> bool {
-        match self.stream_mode() {
-            StreamMode::Off => false,
-            // Teams' native streaming (the gray bubble) is personal-chat
-            // only; group chats and channels use a typing indicator plus
-            // one final reply instead.
-            StreamMode::Partial => self.is_direct_message(message),
-            // Paragraph-split delivery is a sequence of ordinary sends, so
-            // it works in every conversation type.
-            StreamMode::MultiMessage => true,
-        }
-    }
-
-    fn supports_multi_message_streaming(&self) -> bool {
-        self.stream_mode() == StreamMode::MultiMessage
-    }
-
-    fn multi_message_delay_ms(&self) -> u64 {
-        self.config()
-            .map(|cfg| cfg.multi_message_delay_ms)
-            .unwrap_or(0)
+        // Teams' native streaming (the gray bubble) is personal-chat only;
+        // group chats and channels use a typing indicator plus one final
+        // reply instead.
+        self.stream_mode() == StreamMode::Partial && self.is_direct_message(message)
     }
 
     /// Open a streaming draft for the response.
     ///
-    /// - `partial` (personal chats only): register a lazy native-streaming
-    ///   draft. No activity is POSTed here — the placeholder the
-    ///   orchestrator passes is dropped, and the Teams stream opens on the
-    ///   first real update, so the gray bubble never flashes "..." (fast
-    ///   answers skip the stream entirely). Group chats and team channels
-    ///   don't open a partial draft: they use the typing indicator and
-    ///   deliver one final reply.
-    /// - `multi_message` (any conversation type): register paragraph-split
-    ///   state under the returned handle, so concurrent turns on one
-    ///   conversation stay independent. Nothing is POSTed until the first
-    ///   complete paragraph arrives via `update_draft`.
+    /// `partial` (personal chats only) registers a lazy native-streaming
+    /// draft. No activity is POSTed here — the placeholder the orchestrator
+    /// passes is dropped, and the Teams stream opens on the first real
+    /// update, so the gray bubble never flashes "..." (fast answers skip the
+    /// stream entirely). Group chats and team channels don't open a draft:
+    /// they use the typing indicator and deliver one final reply.
     async fn send_draft(&self, message: &SendMessage) -> Result<Option<String>> {
         match self.stream_mode() {
-            StreamMode::Off => Ok(None),
             StreamMode::Partial => {
                 // Personal-chat check straight from the in-memory
                 // conversation store; no token acquisition or network
@@ -1831,8 +1519,10 @@ impl Channel for MsTeamsChannel {
                 {
                     return Ok(None);
                 }
-                let draft_id =
-                    DraftKind::Streaming.handle(self.draft_counter.fetch_add(1, Ordering::Relaxed));
+                let draft_id = format!(
+                    "draft-{}",
+                    self.draft_counter.fetch_add(1, Ordering::Relaxed)
+                );
                 {
                     let mut drafts = self.draft_streams.lock();
                     // Teams allows one streaming response per chat at a time,
@@ -1866,33 +1556,17 @@ impl Channel for MsTeamsChannel {
                 }
                 Ok(Some(draft_id))
             }
-            StreamMode::MultiMessage => {
-                let draft_id = DraftKind::MultiMessage
-                    .handle(self.draft_counter.fetch_add(1, Ordering::Relaxed));
-                self.multi_message.lock().insert(
-                    draft_id.clone(),
-                    MultiMessageState {
-                        sent: String::new(),
-                        thread_ts: message.thread_ts.clone(),
-                    },
-                );
-                Ok(Some(draft_id))
-            }
+            // `off`, and `multi_message` with it: no draft, so the
+            // orchestrator delivers the answer through `send()`.
+            _ => Ok(None),
         }
     }
 
-    /// Stream accumulated content into the draft. For `partial`, open/edit
-    /// the Teams native stream on the first call; for `multi_message`,
-    /// flush any newly completed paragraphs as separate messages. Non-fatal
-    /// failures are logged and swallowed — the finalize pass carries the
-    /// remaining text.
+    /// Stream accumulated content into the draft: open the Teams native
+    /// stream on the first call, edit it afterwards. Non-fatal failures are
+    /// logged and swallowed — the finalize pass carries the remaining text.
     async fn update_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
         if text.trim().is_empty() {
-            return Ok(());
-        }
-        if DraftKind::of(message_id) == DraftKind::MultiMessage {
-            self.flush_multi_message_paragraphs(message_id, recipient, text)
-                .await;
             return Ok(());
         }
         let Some(cfg) = self.config() else {
@@ -1950,12 +1624,6 @@ impl Channel for MsTeamsChannel {
         message_id: &str,
         text: &str,
     ) -> Result<()> {
-        // Status lines belong to the native streaming bubble; a
-        // `multi_message` draft has no bubble, and delivering them as
-        // standalone messages would spam the conversation, so skip them.
-        if DraftKind::of(message_id) == DraftKind::MultiMessage {
-            return Ok(());
-        }
         let Some(cfg) = self.config() else {
             return Ok(());
         };
@@ -2008,11 +1676,6 @@ impl Channel for MsTeamsChannel {
         text: &str,
         _suppress_voice: bool,
     ) -> Result<()> {
-        if DraftKind::of(message_id) == DraftKind::MultiMessage {
-            return self
-                .finalize_multi_message(message_id, recipient, text)
-                .await;
-        }
         let delivered = self
             .finalize_streaming_draft(recipient, message_id, text)
             .await;
@@ -2051,15 +1714,10 @@ impl Channel for MsTeamsChannel {
 
     /// Best-effort removal of an abandoned draft, as when
     /// `interrupt_on_new_message` cancels a turn that a follow-up
-    /// superseded. Drafts whose stream never opened have nothing on the
-    /// wire to take down; already-sent `multi_message` paragraphs stay
-    /// delivered (Teams cannot recall them), so cancel just drops this
-    /// draft's state. Other turns in the same conversation keep theirs.
+    /// superseded. A draft whose stream never opened has nothing on the
+    /// wire to take down, so cancel just drops its state. Other turns in
+    /// the same conversation keep theirs.
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> Result<()> {
-        if DraftKind::of(message_id) == DraftKind::MultiMessage {
-            self.multi_message.lock().remove(message_id);
-            return Ok(());
-        }
         let Some(stream) = self.clear_draft_state(recipient, message_id) else {
             return Ok(());
         };
@@ -2800,27 +2458,9 @@ mod tests {
         .with_token_url(format!("{}/token", connector.uri()))
     }
 
-    /// A channel whose config block can be replaced while a draft is in
-    /// flight, modelling a `config.toml` reload mid-turn. The returned
-    /// handle is what the resolver reads, so a write to it is visible to
-    /// the next callback exactly as a reload would be.
-    fn reloadable_draft_channel(
-        config: MSTeamsConfig,
-        connector: &MockServer,
-    ) -> (MsTeamsChannel, Arc<parking_lot::Mutex<MSTeamsConfig>>) {
-        let live = Arc::new(parking_lot::Mutex::new(config));
-        let resolver = {
-            let live = Arc::clone(&live);
-            Arc::new(move || Some(live.lock().clone()))
-        };
-        let ch = MsTeamsChannel::new("default", resolver, Arc::new(Vec::new))
-            .with_token_url(format!("{}/token", connector.uri()));
-        (ch, live)
-    }
-
-    /// The same, for the reload that removes `[channels.msteams.<alias>]`
-    /// altogether: the resolver then has no block to hand back, which is
-    /// the one `send_context` failure that needs no network to reproduce.
+    /// A channel whose config block a reload can remove: the resolver then
+    /// has no block to hand back, which is the one `send_context` failure
+    /// that needs no network to reproduce.
     fn removable_draft_channel(
         config: MSTeamsConfig,
         connector: &MockServer,
@@ -2868,12 +2508,43 @@ mod tests {
         assert!(partial.supports_draft_updates());
         assert!(!partial.supports_multi_message_streaming());
 
-        // MultiMessage uses the draft pipeline (paragraph-split sends), so
-        // it reports draft support in every conversation type.
+        // Teams does not offer paragraph delivery, and the mode reads as
+        // `off` rather than opening a draft nothing here can serve.
         let multi = connector_dummy(StreamMode::MultiMessage);
-        assert!(multi.supports_draft_updates());
-        assert!(multi.supports_multi_message_streaming());
-        assert_eq!(multi.multi_message_delay_ms(), 800);
+        assert_eq!(multi.stream_mode(), StreamMode::Off);
+        assert!(!multi.supports_draft_updates());
+        assert!(!multi.supports_multi_message_streaming());
+    }
+
+    /// A configured `multi_message` must not reach the draft pipeline at
+    /// all: no handle is issued, so the orchestrator delivers the answer
+    /// through `send()` exactly as `off` does. Asserted from a personal
+    /// chat, the one conversation type that would otherwise stream, and
+    /// through `supports_draft_updates_for`, which the orchestrator consults
+    /// per message.
+    #[tokio::test]
+    async fn multi_message_is_refused_and_delivers_like_off() {
+        let connector = MockServer::start().await;
+        let ch = draft_channel(
+            MSTeamsConfig {
+                stream_mode: StreamMode::MultiMessage,
+                ..streaming_config()
+            },
+            &connector,
+        );
+        record_reference(&ch, &connector, "a:1conv", "personal");
+        let msg = ChannelMessage::new("inbound", "sender", "a:1conv", "hello", "msteams", 0);
+        assert!(
+            !ch.supports_draft_updates_for(&msg),
+            "a refused mode must not claim per-message draft support"
+        );
+        assert!(
+            ch.send_draft(&SendMessage::new("hi", "a:1conv"))
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused mode must not hand out a draft handle"
+        );
     }
 
     #[tokio::test]
@@ -3431,129 +3102,6 @@ mod tests {
         );
     }
 
-    /// `multi_message` paragraphs are published from the streamed text, which
-    /// the orchestrator only strips `<think>` blocks out of, so a tool-call
-    /// envelope in mid-answer would otherwise become a permanent message.
-    /// Stripping in `send` is where Discord and Telegram put it too. The
-    /// prose after the envelope also pins the other half: the sanitized
-    /// finalize text diverges from the stream at the envelope, and the
-    /// paragraph past it must not be delivered a second time.
-    #[tokio::test]
-    async fn a_paragraph_that_is_only_a_tool_envelope_is_never_published() {
-        const CONVERSATION: &str = "a:1conv";
-        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
-
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path(ACTIVITIES))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "m" })),
-            )
-            .mount(&connector)
-            .await;
-
-        let cfg = MSTeamsConfig {
-            stream_mode: StreamMode::MultiMessage,
-            multi_message_delay_ms: 0,
-            ..test_config()
-        };
-        let ch = draft_channel(cfg, &connector);
-        record_reference(&ch, &connector, CONVERSATION, "personal");
-
-        let draft = ch
-            .send_draft(&SendMessage::new("", CONVERSATION))
-            .await
-            .unwrap()
-            .unwrap();
-        ch.update_draft(
-            CONVERSATION,
-            &draft,
-            "Checked it.\n\n<tool_call>{\"name\":\"shell\"}</tool_call>\n\nAll good.\n\n",
-        )
-        .await
-        .unwrap();
-        ch.finalize_draft(CONVERSATION, &draft, "Checked it.\n\nAll good.", false)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            activity_texts_for_path(&connector.received_requests().await.unwrap(), ACTIVITIES),
-            vec!["Checked it.".to_string(), "All good.".to_string()],
-            "the envelope must not surface, and the answer must still arrive"
-        );
-    }
-
-    #[test]
-    fn only_a_whole_message_of_thematic_breaks_renders_as_nothing() {
-        for blank in ["---", "***", "___", "- - -", "-----", "  ---  ", "---\n---"] {
-            assert!(renders_as_nothing(blank), "{blank:?} renders as nothing");
-        }
-        for visible in [
-            "--",            // too few markers to be a break
-            "- item",        // a list bullet
-            "**bold**",      // emphasis, not a break
-            "---\ntext",     // a break plus something to say
-            "text",          //
-            "",              // nothing at all is the empty-content case
-            "\n\n",          //
-            "```\n---\n```", // a break shown inside a fence
-        ] {
-            assert!(!renders_as_nothing(visible), "{visible:?} renders");
-        }
-    }
-
-    /// A model asked to separate its sections emits `---` between them, and
-    /// `multi_message` would turn each one into a message that Teams draws as
-    /// an empty bubble. Shaped after a live turn that produced seven.
-    #[tokio::test]
-    async fn a_section_separator_is_not_published_as_its_own_message() {
-        const CONVERSATION: &str = "a:1conv";
-        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
-
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path(ACTIVITIES))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "m" })),
-            )
-            .mount(&connector)
-            .await;
-
-        let cfg = MSTeamsConfig {
-            stream_mode: StreamMode::MultiMessage,
-            multi_message_delay_ms: 0,
-            ..test_config()
-        };
-        let ch = draft_channel(cfg, &connector);
-        record_reference(&ch, &connector, CONVERSATION, "personal");
-
-        let answer = "## Overview\n\n29 accounts.\n\n---\n\n### Detail\n\nAll good.";
-        let draft = ch
-            .send_draft(&SendMessage::new("", CONVERSATION))
-            .await
-            .unwrap()
-            .unwrap();
-        ch.update_draft(CONVERSATION, &draft, &format!("{answer}\n\n"))
-            .await
-            .unwrap();
-        ch.finalize_draft(CONVERSATION, &draft, answer, false)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            activity_texts_for_path(&connector.received_requests().await.unwrap(), ACTIVITIES),
-            vec![
-                "## Overview".to_string(),
-                "29 accounts.".to_string(),
-                "### Detail".to_string(),
-                "All good.".to_string(),
-            ],
-            "the separator must not become an empty bubble"
-        );
-    }
-
     /// The strip must not touch a reply that only talks about the tags, which
     /// is the case the shared helper is built to keep.
     #[tokio::test]
@@ -3582,54 +3130,11 @@ mod tests {
         );
     }
 
-    /// Finalize is handed a text sanitized independently of the streamed one,
-    /// so what is still owed is measured from the common prefix rather than
-    /// from a byte offset into the stream.
-    #[test]
-    fn the_undelivered_tail_is_measured_against_the_final_text() {
-        // The usual case: the pair is identical, so the tail is what follows
-        // the last flushed paragraph.
-        assert_eq!(
-            undelivered_tail("First.\n\nSecond.", "First.\n\n"),
-            "Second."
-        );
-        // Nothing owed, including when the last paragraph consumed a trailing
-        // blank line that the finalized text no longer carries.
-        assert_eq!(undelivered_tail("First.", "First."), "");
-        assert_eq!(undelivered_tail("First.", "First.\n\n"), "");
-        // Sanitizing dropped a block inside the region already delivered: the
-        // remainder still goes out, and the delivered paragraph is not
-        // repeated.
-        assert_eq!(
-            undelivered_tail("First.\n\nTail.", "First.\n\n<tool_call>x</tool_call>\n\n"),
-            "Tail."
-        );
-        // Same divergence, but the paragraph past it was delivered too: the
-        // prefix stops at the dropped block, so the tail restates a message
-        // that is already in the conversation and is owed to no one.
-        assert_eq!(
-            undelivered_tail(
-                "First.\n\nTail.",
-                "First.\n\n<tool_call>x</tool_call>\n\nTail.\n\n"
-            ),
-            ""
-        );
-        // Divergence from the very first byte leaves the whole text owed,
-        // since none of it can be shown to have been delivered.
-        assert_eq!(undelivered_tail("Answer.", "Let me check.\n\n"), "Answer.");
-        // A multi-byte character that differs mid-way is cut on its own
-        // boundary.
-        assert_eq!(undelivered_tail("状态好", "状况"), "态好");
-    }
-
-    /// The finalized text is trimmed while the streamed one ended on the blank
-    /// line its last paragraph consumed. A byte offset into the stream then
-    /// points past the end of the finalized text, which the channel used to
-    /// answer by resending the whole answer under the paragraphs already
-    /// delivered.
+    /// The other half of that strip: a message the strip empties had nothing
+    /// to say, and Teams rejects an empty activity, so nothing is POSTed
+    /// rather than a blank bubble taking the answer's place.
     #[tokio::test]
-    async fn a_trimmed_final_text_does_not_repeat_the_flushed_paragraphs() {
-        const CONVERSATION: &str = "a:1conv";
+    async fn a_message_that_is_only_a_tool_envelope_is_not_sent() {
         const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
 
         let connector = MockServer::start().await;
@@ -3642,34 +3147,19 @@ mod tests {
             .mount(&connector)
             .await;
 
-        let cfg = MSTeamsConfig {
-            stream_mode: StreamMode::MultiMessage,
-            multi_message_delay_ms: 0,
-            ..test_config()
-        };
-        let ch = draft_channel(cfg, &connector);
-        record_reference(&ch, &connector, CONVERSATION, "personal");
+        let ch = draft_channel(test_config(), &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
+        ch.send(&SendMessage::new(
+            "<tool_call>{\"name\":\"shell\"}</tool_call>",
+            "a:1conv",
+        ))
+        .await
+        .unwrap();
 
-        let draft = ch
-            .send_draft(&SendMessage::new("", CONVERSATION))
-            .await
-            .unwrap()
-            .unwrap();
-        // The streamed text, whose closing blank line the second paragraph
-        // consumes, leaving the delivered prefix longer than the answer.
-        ch.update_draft(CONVERSATION, &draft, "First.\n\nSecond.\n\n")
-            .await
-            .unwrap();
-        // The finalized text, trimmed by the outbound sanitizers.
-        ch.finalize_draft(CONVERSATION, &draft, "First.\n\nSecond.", false)
-            .await
-            .unwrap();
-
-        let requests = connector.received_requests().await.unwrap();
-        assert_eq!(
-            activity_texts_for_path(&requests, ACTIVITIES),
-            vec!["First.".to_string(), "Second.".to_string()],
-            "the finalized text must not resend paragraphs already delivered"
+        assert!(
+            activity_texts_for_path(&connector.received_requests().await.unwrap(), ACTIVITIES)
+                .is_empty(),
+            "an envelope-only message must not reach the conversation"
         );
     }
 
@@ -3891,113 +3381,6 @@ mod tests {
         assert!(!ch.supports_draft_updates_for(&channel));
     }
 
-    #[tokio::test]
-    async fn multi_message_supports_drafts_in_every_conversation_type() {
-        let connector = MockServer::start().await;
-        let cfg = MSTeamsConfig {
-            stream_mode: StreamMode::MultiMessage,
-            multi_message_delay_ms: 0,
-            ..test_config()
-        };
-        let ch = draft_channel(cfg, &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-        record_reference(&ch, &connector, "19:general@thread.tacv2", "channel");
-
-        let personal =
-            ChannelMessage::new("inbound-personal", "sender", "a:1conv", "hi", "msteams", 0);
-        let channel = ChannelMessage::new(
-            "inbound-channel",
-            "sender",
-            "19:general@thread.tacv2",
-            "hi",
-            "msteams",
-            0,
-        );
-        assert!(ch.supports_draft_updates_for(&personal));
-        assert!(ch.supports_draft_updates_for(&channel));
-    }
-
-    /// `multi_message` splits the streamed response on paragraph
-    /// boundaries: each completed paragraph ships as its own message while
-    /// it arrives, and finalize flushes the trailing paragraph.
-    #[tokio::test]
-    async fn multi_message_streaming_sends_paragraphs_then_flushes_tail() {
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path("/teams/v3/conversations/a:1conv/activities"))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "m" })),
-            )
-            .mount(&connector)
-            .await;
-
-        let cfg = MSTeamsConfig {
-            stream_mode: StreamMode::MultiMessage,
-            multi_message_delay_ms: 0,
-            ..test_config()
-        };
-        let ch = draft_channel(cfg, &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        let draft_id = ch
-            .send_draft(&SendMessage::new("", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(draft_id.starts_with("multi-"));
-        assert_eq!(
-            connector.received_requests().await.unwrap().len(),
-            0,
-            "opening a multi-message draft must not hit the network"
-        );
-
-        // Only the first, fully-arrived paragraph flushes; the partial
-        // second one waits for its closing blank line.
-        ch.update_draft("a:1conv", &draft_id, "First paragraph.\n\nSecond para")
-            .await
-            .unwrap();
-        ch.update_draft(
-            "a:1conv",
-            &draft_id,
-            "First paragraph.\n\nSecond paragraph.\n\nThird",
-        )
-        .await
-        .unwrap();
-        ch.finalize_draft(
-            "a:1conv",
-            &draft_id,
-            "First paragraph.\n\nSecond paragraph.\n\nThird and final.",
-            false,
-        )
-        .await
-        .unwrap();
-
-        let texts: Vec<String> = connector
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .filter(|r| r.url.path().ends_with("/activities"))
-            .map(|r| {
-                let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
-                body["text"].as_str().unwrap_or_default().to_string()
-            })
-            .collect();
-        assert_eq!(
-            texts,
-            vec![
-                "First paragraph.".to_string(),
-                "Second paragraph.".to_string(),
-                "Third and final.".to_string(),
-            ]
-        );
-        assert!(
-            ch.multi_message.lock().is_empty(),
-            "multi-message state must be cleared after finalize"
-        );
-    }
-
     /// Activity texts POSTed to `path`, in order.
     fn activity_texts_for_path(requests: &[wiremock::Request], path: &str) -> Vec<String> {
         requests
@@ -4008,367 +3391,6 @@ mod tests {
                 body["text"].as_str().unwrap_or_default().to_string()
             })
             .collect()
-    }
-
-    /// `(type, streamType, text)` for every activity POSTed to `path`,
-    /// reading `streamType` out of the `streaminfo` entity that carries it.
-    /// The first two fields tell a native-streaming frame apart from an
-    /// ordinary message, which the mode-transition tests turn on.
-    fn activity_shapes_for_path(
-        requests: &[wiremock::Request],
-        path: &str,
-    ) -> Vec<(String, String, String)> {
-        requests
-            .iter()
-            .filter(|request| request.url.path() == path)
-            .map(|request| {
-                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-                (
-                    body["type"].as_str().unwrap_or_default().to_string(),
-                    body["entities"][0]["streamType"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                    body["text"].as_str().unwrap_or_default().to_string(),
-                )
-            })
-            .collect()
-    }
-
-    /// `stream_mode` is live config, so an operator editing `config.toml`
-    /// mid-turn flips it under a draft that is already open. A draft
-    /// registered as native streaming has to stay on that lifecycle: the
-    /// paragraph tables never held this handle, so finalizing through them
-    /// would find no entry and deliver nothing at all.
-    #[tokio::test]
-    async fn a_reload_into_multi_message_still_finalizes_a_streaming_draft() {
-        const CONVERSATION: &str = "a:1conv";
-        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
-
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path(ACTIVITIES))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
-            )
-            .mount(&connector)
-            .await;
-
-        let (ch, live) = reloadable_draft_channel(
-            MSTeamsConfig {
-                stream_mode: StreamMode::Partial,
-                draft_update_interval_ms: 0,
-                ..test_config()
-            },
-            &connector,
-        );
-        record_reference(&ch, &connector, CONVERSATION, "personal");
-
-        let draft = ch
-            .send_draft(&SendMessage::new("", CONVERSATION))
-            .await
-            .unwrap()
-            .unwrap();
-        // The reload lands after the handle was issued, before any delta.
-        live.lock().stream_mode = StreamMode::MultiMessage;
-
-        ch.update_draft(CONVERSATION, &draft, "First part.")
-            .await
-            .unwrap();
-        ch.finalize_draft(CONVERSATION, &draft, "First part.\n\nAll done.", false)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            activity_shapes_for_path(&connector.received_requests().await.unwrap(), ACTIVITIES),
-            vec![
-                (
-                    "typing".to_string(),
-                    "streaming".to_string(),
-                    "First part.".to_string()
-                ),
-                (
-                    "message".to_string(),
-                    "final".to_string(),
-                    "First part.\n\nAll done.".to_string()
-                ),
-            ],
-            "the draft must keep streaming and close on its own bubble"
-        );
-        assert!(
-            ch.multi_message.lock().is_empty(),
-            "no paragraph state belongs to a streaming handle"
-        );
-        assert!(
-            ch.draft_streams.lock().is_empty(),
-            "finalize must drop the draft's stream state"
-        );
-    }
-
-    /// The mirror case, for both modes a reload can leave: a
-    /// paragraph-split draft must not be handed to the streaming path,
-    /// which has no record of the paragraphs already delivered and would
-    /// send the whole answer again on top of them.
-    #[tokio::test]
-    async fn a_reload_out_of_multi_message_does_not_resend_delivered_paragraphs() {
-        const CONVERSATION: &str = "a:1conv";
-        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
-
-        for flipped_to in [StreamMode::Partial, StreamMode::Off] {
-            let connector = MockServer::start().await;
-            mock_token_endpoint(&connector).await;
-            Mock::given(method("POST"))
-                .and(path(ACTIVITIES))
-                .respond_with(
-                    ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "m" })),
-                )
-                .mount(&connector)
-                .await;
-
-            let (ch, live) = reloadable_draft_channel(
-                MSTeamsConfig {
-                    stream_mode: StreamMode::MultiMessage,
-                    multi_message_delay_ms: 0,
-                    ..test_config()
-                },
-                &connector,
-            );
-            record_reference(&ch, &connector, CONVERSATION, "personal");
-
-            let draft = ch
-                .send_draft(&SendMessage::new("", CONVERSATION))
-                .await
-                .unwrap()
-                .unwrap();
-            ch.update_draft(CONVERSATION, &draft, "One.\n\nTwo.\n\n")
-                .await
-                .unwrap();
-
-            live.lock().stream_mode = flipped_to;
-
-            ch.finalize_draft(CONVERSATION, &draft, "One.\n\nTwo.\n\nThree.", false)
-                .await
-                .unwrap();
-
-            assert_eq!(
-                activity_texts_for_path(&connector.received_requests().await.unwrap(), ACTIVITIES),
-                vec!["One.".to_string(), "Two.".to_string(), "Three.".to_string()],
-                "a reload to {flipped_to:?} must deliver only what is still owed"
-            );
-            assert!(
-                ch.multi_message.lock().is_empty(),
-                "finalize must drop the draft's paragraph state"
-            );
-        }
-    }
-
-    /// Two turns in one team channel share a reply target: the
-    /// `;messageid=` thread suffix is stripped from it, so only the draft
-    /// handle tells them apart. Each keeps its own offset and thread
-    /// anchor, otherwise one turn's paragraphs land in the other's thread
-    /// and both slice one shared offset out of two different responses.
-    #[tokio::test]
-    async fn concurrent_multi_message_drafts_keep_their_own_thread_and_offset() {
-        const CONVERSATION: &str = "19:general@thread.tacv2";
-        let alice_path =
-            format!("/teams/v3/conversations/{CONVERSATION};messageid=t-alice/activities");
-        let bob_path = format!("/teams/v3/conversations/{CONVERSATION};messageid=t-bob/activities");
-
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        for thread_path in [&alice_path, &bob_path] {
-            Mock::given(method("POST"))
-                .and(path(thread_path.clone()))
-                .respond_with(
-                    ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "m" })),
-                )
-                .mount(&connector)
-                .await;
-        }
-
-        let cfg = MSTeamsConfig {
-            stream_mode: StreamMode::MultiMessage,
-            multi_message_delay_ms: 0,
-            ..test_config()
-        };
-        let ch = draft_channel(cfg, &connector);
-        record_reference(&ch, &connector, CONVERSATION, "channel");
-
-        let alice = ch
-            .send_draft(&SendMessage::new("", CONVERSATION).in_thread(Some("t-alice".to_string())))
-            .await
-            .unwrap()
-            .unwrap();
-        let bob = ch
-            .send_draft(&SendMessage::new("", CONVERSATION).in_thread(Some("t-bob".to_string())))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_ne!(alice, bob, "each draft must get its own handle");
-
-        // Interleaved the way two dispatcher workers stream at once.
-        ch.update_draft(CONVERSATION, &alice, "Alice one.\n\n")
-            .await
-            .unwrap();
-        ch.update_draft(CONVERSATION, &bob, "Bob one.\n\n")
-            .await
-            .unwrap();
-        ch.finalize_draft(CONVERSATION, &alice, "Alice one.\n\nAlice two.", false)
-            .await
-            .unwrap();
-        ch.finalize_draft(CONVERSATION, &bob, "Bob one.\n\nBob two.", false)
-            .await
-            .unwrap();
-
-        let requests = connector.received_requests().await.unwrap();
-        assert_eq!(
-            activity_texts_for_path(&requests, &alice_path),
-            vec!["Alice one.".to_string(), "Alice two.".to_string()],
-        );
-        assert_eq!(
-            activity_texts_for_path(&requests, &bob_path),
-            vec!["Bob one.".to_string(), "Bob two.".to_string()],
-        );
-        assert!(
-            ch.multi_message.lock().is_empty(),
-            "both drafts must clear their own state on finalize"
-        );
-    }
-
-    /// `interrupt_on_new_message` cancels a superseded turn while its
-    /// replacement is already streaming, and cancellation is cooperative,
-    /// so the two overlap. Cancelling drops only the abandoned draft; the
-    /// live one keeps delivering, and the cancelled one delivers nothing
-    /// more.
-    #[tokio::test]
-    async fn cancelling_one_multi_message_draft_leaves_the_other_streaming() {
-        const CONVERSATION: &str = "a:1conv";
-        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
-
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path(ACTIVITIES))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "m" })),
-            )
-            .mount(&connector)
-            .await;
-
-        let cfg = MSTeamsConfig {
-            stream_mode: StreamMode::MultiMessage,
-            multi_message_delay_ms: 0,
-            ..test_config()
-        };
-        let ch = draft_channel(cfg, &connector);
-        record_reference(&ch, &connector, CONVERSATION, "personal");
-
-        let superseded = ch
-            .send_draft(&SendMessage::new("", CONVERSATION))
-            .await
-            .unwrap()
-            .unwrap();
-        let live = ch
-            .send_draft(&SendMessage::new("", CONVERSATION))
-            .await
-            .unwrap()
-            .unwrap();
-
-        ch.cancel_draft(CONVERSATION, &superseded).await.unwrap();
-        assert!(
-            ch.multi_message.lock().contains_key(&live),
-            "cancelling the superseded turn must not take the live turn's state with it"
-        );
-
-        ch.update_draft(CONVERSATION, &live, "Live one.\n\n")
-            .await
-            .unwrap();
-        ch.finalize_draft(CONVERSATION, &live, "Live one.\n\nLive two.", false)
-            .await
-            .unwrap();
-
-        // The cancelled turn is inert: its own update and finalize add
-        // nothing, since an abandoned answer must not surface later.
-        ch.update_draft(CONVERSATION, &superseded, "Superseded one.\n\n")
-            .await
-            .unwrap();
-        ch.finalize_draft(
-            CONVERSATION,
-            &superseded,
-            "Superseded one.\n\nSuperseded two.",
-            false,
-        )
-        .await
-        .unwrap();
-
-        let requests = connector.received_requests().await.unwrap();
-        assert_eq!(
-            activity_texts_for_path(&requests, ACTIVITIES),
-            vec!["Live one.".to_string(), "Live two.".to_string()],
-        );
-        assert!(ch.multi_message.lock().is_empty());
-    }
-
-    /// A paragraph whose send fails must not be skipped. The offset is
-    /// committed only after the send lands, so the paragraph is retried on
-    /// the next flush and, failing that, carried into the finalize
-    /// message — dropping it would silently truncate the answer.
-    #[tokio::test]
-    async fn failed_paragraph_send_is_not_dropped_from_the_response() {
-        const CONVERSATION: &str = "a:1conv";
-        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
-
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        // The first activity POST fails, every later one succeeds.
-        Mock::given(method("POST"))
-            .and(path(ACTIVITIES))
-            .respond_with(ResponseTemplate::new(500))
-            .up_to_n_times(1)
-            .mount(&connector)
-            .await;
-        Mock::given(method("POST"))
-            .and(path(ACTIVITIES))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "m" })),
-            )
-            .mount(&connector)
-            .await;
-
-        let cfg = MSTeamsConfig {
-            stream_mode: StreamMode::MultiMessage,
-            multi_message_delay_ms: 0,
-            ..test_config()
-        };
-        let ch = draft_channel(cfg, &connector);
-        record_reference(&ch, &connector, CONVERSATION, "personal");
-
-        let draft = ch
-            .send_draft(&SendMessage::new("", CONVERSATION))
-            .await
-            .unwrap()
-            .unwrap();
-        ch.update_draft(CONVERSATION, &draft, "First.\n\nSecond par")
-            .await
-            .unwrap();
-        ch.finalize_draft(CONVERSATION, &draft, "First.\n\nSecond and last.", false)
-            .await
-            .unwrap();
-
-        let requests = connector.received_requests().await.unwrap();
-        assert_eq!(
-            activity_texts_for_path(&requests, ACTIVITIES),
-            vec![
-                // The attempt that failed, then its retry on the next
-                // flush, then the trailing paragraph.
-                "First.".to_string(),
-                "First.".to_string(),
-                "Second and last.".to_string(),
-            ],
-            "the failed paragraph must still reach the conversation"
-        );
-        assert!(ch.multi_message.lock().is_empty());
     }
 
     /// The outbound typing indicator is a one-shot Bot Framework `typing`
