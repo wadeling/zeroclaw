@@ -531,6 +531,27 @@ down. Nothing is retried: the one context that could close the stream is the
 one that could not be resolved, and finalize's caller is already resending the
 answer as an ordinary message, which a retry here would only delay.
 
+Closing on the streamed content publishes draft-boundary text as a `message`
+activity, which is the shape the next section refuses for `multi_message`, and
+the difference is the reason this one is allowed. There, a paragraph is a
+permanent message no later reply can edit or recall, published for every
+answer. Here the message exists to be withdrawn: the `DELETE` that follows it
+is the point of the pair, the text has already been on the same screen in the
+bubble it is closing, and the path runs only when a turn is abandoned. What
+remains is the case where the delete does not land, which is why that failure
+is a `WARN` naming the stream rather than a silent one. The closing text is
+also deliberately not re-sanitized here: a final message is accepted because it
+contains what was streamed, so altering it would forfeit the one property that
+makes this takedown reliable.
+
+Finalize clears the draft's state before its closing request rather than after,
+so the chat's stream slot is free while that request is in flight. A concurrent
+turn arriving inside that window opens a draft whose stream Teams may still
+refuse, since the first stream has not closed yet. The window is one request
+wide and the cost is that turn streaming nothing; holding the slot until the
+request returned would instead risk keeping it forever whenever the request
+failed, which is the outcome the ordering is chosen against.
+
 ### `multi_message` is not offered
 
 `stream_mode = "multi_message"` splits an answer into one message per
@@ -605,7 +626,7 @@ derive, `#[secret]` on the secret field):
 | `mention_only` | `Option<bool>` | `None` (= true in groups) | group/channel gating only; personal chats are exempt by definition (gated by `allow_dms` instead). Named `mention_only` to match the existing telegram/mattermost convention. |
 | `stream_mode` | `StreamMode` | `Off` | `off` / `partial` (the gray native streaming bubble; 1:1 chats only, groups fall back to typing plus one final reply and team channels to the reply alone); same enum Telegram/Discord/Lark use, whose third value `multi_message` this channel refuses and reads as `off` (§"`multi_message` is not offered") |
 | `draft_update_interval_ms` | u64 | `1500` | draft flush cadence; clears Teams' ~1/s streaming rate limit with the same headroom Microsoft's own SDK buffers to |
-| `interrupt_on_new_message` | bool | `false` | when `true`, a newer message from the same sender in the same conversation cancels the in-flight agent run and starts a fresh response (history preserved); default queues instead. Feeds the orchestrator's `InterruptFlags`. **Resolved from the `default` alias only** and then applied to every `msteams` alias (`InterruptOnNewMessageConfig` reads `channels.msteams.get("default")`), so a value set on a non-`default` alias has no effect. Per-alias resolution is deferred (§9). |
+| `interrupt_on_new_message` | bool | `false` | when `true`, a newer message from the same sender in the same conversation cancels the in-flight agent run and starts a fresh response (history preserved); default queues instead. Feeds the orchestrator's `InterruptOnNewMessageConfig`. **Resolved from the `default` alias only** and then applied to every `msteams` alias (`InterruptOnNewMessageConfig` reads `channels.msteams.get("default")`), so a value set on a non-`default` alias has no effect. Per-alias resolution is deferred (§9). |
 
 Multiple aliases (`[channels.msteams.<alias>]`) follow the standard
 HashMap pattern; each alias runs its own listener, so aliases must use
@@ -619,9 +640,9 @@ channel-wide (see the field note above).
 | --- | --- |
 | `crates/zeroclaw-channels/src/lib.rs` | `#[cfg(feature = "channel-msteams")] pub mod msteams;` |
 | `crates/zeroclaw-channels/Cargo.toml` | `channel-msteams = ["dep:jsonwebtoken"]`; add to the aggregate feature list. `axum`, `reqwest`, `jsonwebtoken` (v10, aws-lc-rs backend) are already dependencies. |
-| `crates/zeroclaw-channels/src/orchestrator/mod.rs` | `pub use crate::msteams::MsTeamsChannel;`; `"msteams" =>` arm in `build_channel` + `#[cfg(not(...))]` bail arm; configured-channel collection loop; add `msteams` to the "Unknown channel" supported list; add `msteams` field to `InterruptFlags` (mechanical updates to the many test literals). |
+| `crates/zeroclaw-channels/src/orchestrator/mod.rs` | `pub use crate::msteams::MsTeamsChannel;`; `"msteams" =>` arm in `build_channel_by_id` + `#[cfg(not(...))]` bail arm; configured-channel collection loop; add `msteams` to the "Unknown channel" supported list; add `msteams` field to `InterruptOnNewMessageConfig` (mechanical updates to the many test literals). |
 | `crates/zeroclaw-channels/src/listing.rs` | `ChannelCompileSpec { schema_name: Some("MSTeams"), type_keys: &["msteams"], compiled: cfg!(feature = "channel-msteams") }` |
-| `crates/zeroclaw-config/src/schema.rs` | `MSTeamsConfig` struct + `pub msteams: HashMap<String, MSTeamsConfig>` on the channels struct; add to the `channel.*` allowlist const, `ChannelInfo` list, `is_any_enabled`, row iterator, `Configurable` registration list, `ChannelConfig` impl. |
+| `crates/zeroclaw-config/src/schema.rs` | `MSTeamsConfig` struct + `pub msteams: HashMap<String, MSTeamsConfig>` on the channels struct; add to the `channel.*` allowlist const, `ChannelInfo` list, `has_any_enabled`, row iterator, `Configurable` registration list, `ChannelConfig` impl. |
 | `crates/zeroclaw-api/src/attribution.rs` | `ChannelKind` variant `#[strum(serialize = "msteams")] MsTeams` |
 | `crates/zeroclaw-api/src/channel.rs` | add `supports_draft_updates_for(&self, msg)` to the `Channel` trait **with a default implementation** delegating to `supports_draft_updates()`, so no other channel changes behavior. Teams overrides it because its draft support depends on conversation type; the orchestrator's two draft/typing decision sites call the per-message form. |
 | `crates/zeroclaw-channels/src/paced_channel.rs` | forward `supports_draft_updates_for` to the wrapped channel, so the pacing wrapper does not flatten the per-message answer back to the capability-wide one. |

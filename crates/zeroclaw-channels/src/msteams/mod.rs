@@ -12,8 +12,10 @@
 //! `streaminfo` typing activities, replaced by the final message. The
 //! stream opens lazily on the first real status line or content chunk
 //! (mirroring OpenClaw's `HttpStream`), so no placeholder frame is ever
-//! posted. Group chats and team channels don't open drafts at all: they
-//! show the ordinary typing indicator and receive one final reply.
+//! posted. Group chats and team channels don't open drafts at all and
+//! receive one final reply; a group chat also shows the ordinary typing
+//! indicator, which Teams draws in every conversation type except a team
+//! channel.
 //!
 //! Design: `docs/msteams-channel-design.md`.
 
@@ -666,8 +668,9 @@ impl MsTeamsChannel {
     /// Issue a Connector API request; returns the activity id from the
     /// response body when the Connector provides one.
     ///
-    /// Under [`ThrottlePolicy::Retry`] a `429` is retried up to
-    /// [`CONNECTOR_MAX_ATTEMPTS`] times, which Teams requires of every caller:
+    /// Under [`ThrottlePolicy::Retry`] a `429` is waited out and the request
+    /// reissued, for [`CONNECTOR_MAX_ATTEMPTS`] attempts in all, which Teams
+    /// requires of every caller:
     /// its per-conversation ceiling is 7 sends per second and a burst is
     /// expected to be waited out, not surfaced as a failed reply. Other
     /// statuses are returned as errors on the first response. Notably
@@ -1340,8 +1343,8 @@ impl Channel for MsTeamsChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
-        // The transport-level backstop Telegram, WeChat and WhatsApp Web also
-        // keep. The orchestrator strips envelopes from assistant text before
+        // The transport-level backstop Telegram, Discord, WeChat and WhatsApp
+        // Web also keep. The orchestrator strips envelopes from assistant text before
         // either a draft frame or a finalized reply, but nothing in the trait
         // obliges a caller to have run that pass, and this method also carries
         // split chunks and the oversize-stream handoff. Stripping once here
@@ -1478,8 +1481,9 @@ impl Channel for MsTeamsChannel {
     /// seconds, so the orchestrator re-invokes this on its refresh
     /// interval for the duration of the turn. Personal-chat native
     /// streaming renders its own gray bubble and the orchestrator
-    /// suppresses typing there; this covers group chats and non-streaming
-    /// (`off`) turns.
+    /// suppresses typing there, so what reaches the wire is a group chat,
+    /// or a personal chat on a turn that opened no draft. A team channel
+    /// draws no indicator at all and is dropped below.
     async fn start_typing(&self, recipient: &str) -> Result<()> {
         // A team channel has no typing indicator, for a bot or for a human
         // author. The Connector still takes the activity — it answers 202 and
@@ -1525,9 +1529,10 @@ impl Channel for MsTeamsChannel {
     }
 
     fn supports_draft_updates_for(&self, message: &ChannelMessage) -> bool {
-        // Teams' native streaming (the gray bubble) is personal-chat only;
-        // group chats and channels use a typing indicator plus one final
-        // reply instead.
+        // Teams' native streaming (the gray bubble) is personal-chat only.
+        // A group chat gets a typing indicator and one final reply; a team
+        // channel gets the final reply alone, since Teams draws no
+        // indicator there ([`Self::start_typing`]).
         self.stream_mode() == StreamMode::Partial && self.is_direct_message(message)
     }
 
@@ -1537,8 +1542,9 @@ impl Channel for MsTeamsChannel {
     /// draft. No activity is POSTed here — the placeholder the orchestrator
     /// passes is dropped, and the Teams stream opens on the first real
     /// update, so the gray bubble never flashes "..." (fast answers skip the
-    /// stream entirely). Group chats and team channels don't open a draft:
-    /// they use the typing indicator and deliver one final reply.
+    /// stream entirely). Group chats and team channels don't open a draft
+    /// and deliver one final reply, and neither does a personal chat that
+    /// already has a live stream, since Teams allows one per chat.
     async fn send_draft(&self, message: &SendMessage) -> Result<Option<String>> {
         match self.stream_mode() {
             StreamMode::Partial => {
@@ -1598,8 +1604,12 @@ impl Channel for MsTeamsChannel {
     }
 
     /// Stream accumulated content into the draft: open the Teams native
-    /// stream on the first call, edit it afterwards. Non-fatal failures are
-    /// logged and swallowed — the finalize pass carries the remaining text.
+    /// stream on the first call, push a further cumulative frame on each
+    /// later one (the protocol replaces the bubble's text rather than
+    /// appending to it). Frames stop once the response outgrows a Teams
+    /// message, since none of them could land past that point. Non-fatal
+    /// failures are logged and swallowed: the finalize pass carries the
+    /// whole answer regardless of how many frames reached the wire.
     async fn update_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
         if text.trim().is_empty() {
             return Ok(());
@@ -1704,6 +1714,13 @@ impl Channel for MsTeamsChannel {
     /// streaming bubble with a normal message and drops the status
     /// history. If it never opened (fast answer, no intermediate
     /// updates), deliver a plain message.
+    ///
+    /// Two paths cannot end that way and take the bubble down instead: an
+    /// answer too large for one activity, which is then delivered as split
+    /// messages, and a final message Teams refuses, which the orchestrator
+    /// answers by resending through [`Channel::send`]. Both live in
+    /// [`Self::finalize_streaming_draft`]. Whatever happens, the draft's
+    /// local state is gone by the time this returns.
     async fn finalize_draft(
         &self,
         recipient: &str,
