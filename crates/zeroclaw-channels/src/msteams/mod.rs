@@ -86,10 +86,12 @@ struct DraftStream {
     /// to — which [`MsTeamsChannel::send_draft`] needs, since Teams allows
     /// only one stream per chat at a time.
     conversation: String,
-    /// When the draft was registered, used to age out the entry above.
-    /// A draft is normally removed on finalize or cancel; this bounds the
-    /// damage if some path drops one, so a chat cannot lose streaming for
-    /// the rest of the process.
+    /// When the draft was registered. A draft is normally removed on
+    /// finalize or cancel; past [`TEAMS_STREAM_SESSION_LIMIT`] Teams has
+    /// ended the stream regardless, which is what lets
+    /// [`MsTeamsChannel::sweep_expired_draft_state`] drop one that no path
+    /// ever closed — so an abandoned draft costs its chat neither streaming
+    /// nor a map entry for the life of the process.
     opened_at: std::time::Instant,
     /// Teams `streamId` — the Connector-assigned id of the first
     /// activity. `None` while the draft is lazily pending (no activity
@@ -369,8 +371,9 @@ pub struct MsTeamsChannel {
     /// Per-draft Teams streaming state, keyed by the locally assigned
     /// draft handle returned from `send_draft`. Source of truth created
     /// here — the handle, streaminfo sequence counter, and (once the
-    /// stream opens) the Teams `streamId` exist nowhere else. Entries
-    /// are removed on finalize/cancel.
+    /// stream opens) the Teams `streamId` exist nowhere else. Entries are
+    /// removed on finalize/cancel, or swept once expired if a turn reached
+    /// neither ([`MsTeamsChannel::sweep_expired_draft_state`]).
     draft_streams: parking_lot::Mutex<HashMap<String, DraftStream>>,
     /// Monotonic source for locally assigned draft handles.
     draft_counter: AtomicU64,
@@ -756,6 +759,37 @@ impl MsTeamsChannel {
         self.last_draft_update
             .lock()
             .insert(recipient.to_string(), Instant::now());
+    }
+
+    /// Drop per-draft state that no live turn can still use, so neither map
+    /// grows for the life of the process.
+    ///
+    /// [`Self::clear_draft_state`] is the only other thing that empties
+    /// them, and a draft the orchestrator neither finalized nor cancelled
+    /// never reaches it. Ageing the entries out there is not possible —
+    /// nothing calls into the channel on that draft again — so the sweep
+    /// belongs on the next turn's way in. [`Channel::send_draft`] is where
+    /// that is: it already walks `draft_streams` to enforce one stream per
+    /// chat, and it runs once per turn rather than once per frame.
+    ///
+    /// Neither removal can change behaviour. A draft past
+    /// [`TEAMS_STREAM_SESSION_LIMIT`] is one Teams has already ended, so it
+    /// is no longer eligible to hold its chat's stream slot and no callback
+    /// could do anything with the `streamId` it carries. A pacing entry
+    /// older than the configured interval is one
+    /// [`Self::draft_update_allowed`] already answers "allowed" for, and an
+    /// interval of `0` makes it skip the map entirely.
+    fn sweep_expired_draft_state(&self) {
+        self.draft_streams
+            .lock()
+            .retain(|_, draft| draft.opened_at.elapsed() < TEAMS_STREAM_SESSION_LIMIT);
+        let interval_ms = self.config().map_or(0, |cfg| cfg.draft_update_interval_ms);
+        let mut pacing = self.last_draft_update.lock();
+        if interval_ms == 0 {
+            pacing.clear();
+        } else {
+            pacing.retain(|_, last| last.elapsed().as_millis() < u128::from(interval_ms));
+        }
     }
 
     /// Drop all local state for a draft (finalized or cancelled),
@@ -1519,6 +1553,10 @@ impl Channel for MsTeamsChannel {
                 {
                     return Ok(None);
                 }
+                // Before the slot check below reads the map, so a draft some
+                // path abandoned neither answers that check nor stays in
+                // memory behind it.
+                self.sweep_expired_draft_state();
                 let draft_id = format!(
                     "draft-{}",
                     self.draft_counter.fetch_add(1, Ordering::Relaxed)
@@ -1535,10 +1573,7 @@ impl Channel for MsTeamsChannel {
                     // message, which is what group chats already do. Opening
                     // it anyway would not stream either: every frame is spent
                     // on a stream Teams refuses to start.
-                    if drafts.values().any(|draft| {
-                        draft.conversation == base_id
-                            && draft.opened_at.elapsed() < TEAMS_STREAM_SESSION_LIMIT
-                    }) {
+                    if drafts.values().any(|draft| draft.conversation == base_id) {
                         return Ok(None);
                     }
                     drafts.insert(
@@ -3487,12 +3522,78 @@ mod tests {
         if let Some(draft) = ch.draft_streams.lock().get_mut(&stale) {
             draft.opened_at = std::time::Instant::now() - TEAMS_STREAM_SESSION_LIMIT;
         }
+        let successor = ch
+            .send_draft(&SendMessage::new("later", "a:1conv"))
+            .await
+            .unwrap();
         assert!(
-            ch.send_draft(&SendMessage::new("later", "a:1conv"))
-                .await
-                .unwrap()
-                .is_some(),
+            successor.is_some(),
             "a stream Teams has already ended cannot hold the chat's slot"
+        );
+        // Not just skipped by the slot check: dropped. Nothing calls back
+        // into the channel on an abandoned draft, so if the entry survived
+        // this it would survive for the life of the process.
+        let drafts = ch.draft_streams.lock();
+        assert!(
+            !drafts.contains_key(&stale),
+            "the abandoned draft must leave the map, not merely stop counting"
+        );
+        assert_eq!(drafts.len(), 1, "only the successor may remain");
+    }
+
+    /// The pacing map is keyed by recipient and cleared only by the draft
+    /// that owns one, so a turn whose mark outlived its draft would leave a
+    /// key nothing removes. Entries past the interval cannot gate anything
+    /// anyway, which is what makes dropping them free.
+    #[tokio::test]
+    async fn a_pacing_entry_no_draft_owns_does_not_outlive_its_interval() {
+        let connector = MockServer::start().await;
+        mock_token_endpoint(&connector).await;
+        let mut config = streaming_config();
+        config.draft_update_interval_ms = 50;
+        let ch = draft_channel(config, &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
+
+        // The shape the race leaves behind: a mark for a recipient with no
+        // draft to clear it.
+        ch.mark_draft_update("a:9gone");
+        assert!(ch.last_draft_update.lock().contains_key("a:9gone"));
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        ch.send_draft(&SendMessage::new("hi", "a:1conv"))
+            .await
+            .unwrap()
+            .expect("a personal chat with no live draft opens one");
+        assert!(
+            ch.last_draft_update.lock().is_empty(),
+            "a pacing entry the interval has already released must be dropped"
+        );
+    }
+
+    /// The sweep must not release a floor that is still holding: an entry
+    /// younger than the interval is the one thing keeping the next frame off
+    /// Teams' ~1/s streaming limit.
+    #[tokio::test]
+    async fn the_sweep_keeps_a_pacing_entry_that_is_still_gating() {
+        let connector = MockServer::start().await;
+        mock_token_endpoint(&connector).await;
+        let mut config = streaming_config();
+        config.draft_update_interval_ms = 60_000;
+        let ch = draft_channel(config, &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
+
+        ch.mark_draft_update("a:1conv");
+        ch.send_draft(&SendMessage::new("hi", "a:1conv"))
+            .await
+            .unwrap()
+            .expect("a personal chat with no live draft opens one");
+        assert!(
+            ch.last_draft_update.lock().contains_key("a:1conv"),
+            "a floor the interval has not released must survive the sweep"
+        );
+        assert!(
+            !ch.draft_update_allowed("a:1conv", 60_000),
+            "and must still refuse the next frame"
         );
     }
 
