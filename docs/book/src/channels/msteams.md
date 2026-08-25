@@ -234,8 +234,9 @@ works.
 warning at startup and behaves as `off`: paragraph delivery would publish each
 paragraph as a permanent message drawn from mid-turn draft text, which the
 outbound credential-redaction pass does not cover, and Teams cannot recall a
-message once sent. That draft boundary is shared with Discord and Matrix and is
-being addressed there; until it is, Teams offers `off` and `partial` only.
+message once sent. That draft boundary is shared with Discord and Matrix, so the
+fix belongs there rather than in one channel; until it lands, Teams offers `off`
+and `partial` only.
 
 Group chats show the ordinary typing indicator while the turn runs, at any
 setting. Team channels show no indicator at all, because Teams has none in a

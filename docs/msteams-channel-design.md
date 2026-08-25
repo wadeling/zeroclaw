@@ -561,10 +561,10 @@ the operator's log. The channel therefore offers `off` and `partial` only.
 
 A paragraph-split implementation existed in this branch and was withdrawn on
 review. What it published came from the draft boundary, which the orchestrator
-sanitizes with `sanitize_streaming_draft_text` (`orchestrator/mod.rs:3668`):
+sanitizes with `sanitize_streaming_draft_text` in `orchestrator/mod.rs`:
 that pass removes reasoning and tool-protocol envelopes, but not the two
 stages the delivery path adds, tool-narration stripping and the configured
-credential redaction (`redact_channel_outbound_leaks`, `:3985`). Under
+credential redaction (`redact_channel_outbound_leaks`). Under
 `partial` the gap is transient, since the sanitized final message replaces the
 bubble's text; a paragraph is a permanent message that no later reply can edit
 or recall, so a credential in mid-answer text would stay in the conversation.
@@ -573,9 +573,10 @@ Reviewer finding on
 
 Closing the gap belongs at the shared boundary, not here. Redacting per channel
 would put the policy in two places, and the exposure is not Teams-specific:
-Matrix publishes paragraphs from the same text (`matrix.rs:3415`), so a fix in
-`run_draft_updater` covers every channel that delivers a draft permanently,
-including this one if the mode is reintroduced. Teams declines the mode until
+Matrix publishes paragraphs from the same text (its multi-message paragraph
+emitter in `matrix.rs`), so a fix in `run_draft_updater` covers every channel
+that delivers a draft permanently, including this one if the mode is
+reintroduced. Teams declines the mode until
 then rather than shipping a delivery path whose safety depends on a boundary
 that is not yet safe.
 
@@ -662,7 +663,7 @@ Pre-edit ritual answers for every state-bearing field:
 | Connector OAuth token cache | Source of truth is **created here** (issued by Entra at runtime). A time-bounded materialized credential, not a copy of config state. `tokio::sync::RwLock` with expiry. Bounded by the credentials as well as by the clock: the entry records a SHA-256 fingerprint of the `app_id`/`app_password` pair Entra minted it for, and is served back only to that pair. Without it, a same-tenant secret rotation or bot-identity swap would keep posting under the retired credential for up to the token's remaining hour, since the provider is cached per tenant and the credentials are passed per call. The fingerprint is stored instead of the pair so the cache can reject a mismatch without holding the secret twice. |
 | JWKS cache | Source of truth is Microsoft's JWKS endpoint; the cached copy is a runtime materialized view. Two independent bounds with separate timestamps: the last *attempt* spaces fetches at least 60s apart regardless of outcome, and the last *success* caps how long a key set may be served at 24h. A stale cache whose mandatory refresh fails or is rate-limited serves nothing. |
 | ConversationReference map | Source of truth is **created here** (delivered by Teams per activity; exists nowhere else in the codebase). In-memory `RwLock<HashMap<String, ConversationReference>>`. |
-| `bot_identity` (id/name) | Source of truth is the platform (first inbound `activity.recipient`). Write-once (`std::sync::OnceLock`), the same shape `mattermost.rs::bot_identity` uses for the same reason. |
+| `bot_identity` (id/name) | Source of truth is the platform (first inbound `activity.recipient`). Write-once `std::sync::OnceLock`. `mattermost.rs::bot_identity` answers the same question with a `tokio::sync::OnceCell` because it has to await an API call to learn its own identity; Teams is handed the identity on every inbound activity, so the initialization is synchronous and an async cell would buy nothing. |
 | Draft stream state (`streamId`, `streamSequence` per in-flight draft) | Source of truth is **created here** (assigned by Teams / incremented locally per protocol). Ephemeral per-draft map, removed on finalize/cancel, and removed there whether or not anything reached the wire: nothing revisits a handle the orchestrator has fallen back on, so a preflight failure that returned early would otherwise leave the entry holding this chat's one stream slot. Since an entry is what makes `send_draft` refuse a second concurrent stream, an abandoned turn must not cost the chat the turn that replaced it. A draft that reaches neither call is swept on the next `send_draft` once it is older than the two-minute session limit, because nothing calls back into the channel on such a handle and the map would otherwise grow for the life of the process. |
 | Draft update pacing (last update per recipient) | Source of truth is **created here** (when this channel last edited a draft). Keyed by recipient rather than by handle, because the interval it enforces is a per-conversation Connector limit rather than a per-draft one. Only the clear that actually removed a draft drops the key: finalize clears twice around its closing request, and the next turn can open a draft in between, whose floor a second clear would otherwise discard. A key whose mark outlived its draft is swept alongside the drafts, but only once it is older than the configured interval, at which point `draft_update_allowed` already answers "allowed" for it and dropping it cannot change what any frame does. |
 | Effective `stream_mode` | Source of truth is `Config`; the accessor resolves it per call and is the one place a refused `multi_message` becomes `off`, so no caller can act on the raw value. Nothing is cached, so a reload takes effect on the next call. One delivery lifecycle owns every draft, which is why no parallel record of "which path owns this handle" exists to keep in sync. |
