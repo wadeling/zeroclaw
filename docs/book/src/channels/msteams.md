@@ -231,12 +231,15 @@ superseded, rather than a bubble frozen mid-answer whose Stop button no longer
 works.
 
 `stream_mode = "multi_message"` is **not supported on Teams**. Setting it logs a
-warning at startup and behaves as `off`: paragraph delivery would publish each
-paragraph as a permanent message drawn from mid-turn draft text, which the
-outbound credential-redaction pass does not cover, and Teams cannot recall a
-message once sent. That draft boundary is shared with Discord and Matrix, so the
-fix belongs there rather than in one channel; until it lands, Teams offers `off`
-and `partial` only.
+warning at startup and behaves as `off`. Paragraph delivery would publish each
+paragraph as a permanent message drawn from mid-turn draft text, and Teams
+cannot recall a message once sent, so the mode needs a review of its own rather
+than arriving alongside unrelated work. Teams offers `off` and `partial` only.
+
+Draft text is redacted under `security.leak_detection` before each update
+reaches Teams, using the same policy applied to a final reply. This covers a
+credential the model emits across several streaming chunks, where no single
+chunk looks like a secret.
 
 Group chats show the ordinary typing indicator while the turn runs, at any
 setting. Team channels show no indicator at all, because Teams has none in a

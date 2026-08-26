@@ -560,25 +560,34 @@ paragraph, the way Discord and Matrix do. Teams refuses the value instead:
 the operator's log. The channel therefore offers `off` and `partial` only.
 
 A paragraph-split implementation existed in this branch and was withdrawn on
-review. What it published came from the draft boundary, which the orchestrator
-sanitizes with `sanitize_streaming_draft_text` in `orchestrator/mod.rs`:
-that pass removes reasoning and tool-protocol envelopes, but not the two
-stages the delivery path adds, tool-narration stripping and the configured
-credential redaction (`redact_channel_outbound_leaks`). Under
-`partial` the gap is transient, since the sanitized final message replaces the
-bubble's text; a paragraph is a permanent message that no later reply can edit
-or recall, so a credential in mid-answer text would stay in the conversation.
-Reviewer finding on
+review. What it published came from the draft boundary, which at the time the
+orchestrator sanitized with `sanitize_streaming_draft_text` alone: that pass
+removes reasoning and tool-protocol envelopes, but not the configured
+credential redaction (`redact_channel_outbound_leaks`) that the delivery path
+adds. Under `partial` the exposure was transient, since the sanitized final
+message replaces the bubble's text; a paragraph is a permanent message that no
+later reply can edit or recall, so a credential in mid-answer text would have
+stayed in the conversation. Reviewer finding on
 [#9241](https://github.com/zeroclaw-labs/zeroclaw/pull/9241#issuecomment-5332586063).
 
-Closing the gap belongs at the shared boundary, not here. Redacting per channel
-would put the policy in two places, and the exposure is not Teams-specific:
-Matrix publishes paragraphs from the same text (its multi-message paragraph
-emitter in `matrix.rs`), so a fix in `run_draft_updater` covers every channel
-that delivers a draft permanently, including this one if the mode is
-reintroduced. Teams declines the mode until
-then rather than shipping a delivery path whose safety depends on a boundary
-that is not yet safe.
+That gap is now closed at the shared boundary rather than per channel, so the
+policy stays in one place. `run_draft_updater` applies
+`redact_channel_outbound_leaks` under the same `security.leak_detection` policy
+and the same outbound format the final sanitizer resolves, on every frame before
+it reaches the transport. This matters most for a credential the model emits
+across several deltas, which no single delta looks like and which the final
+sanitizer cannot help with, because by the time it runs the frame has already
+been displayed. Every channel that renders a draft benefits. Matrix's
+single-message updater is a separate path and still carries the gap.
+
+Drafts and final delivery are now held to the same redaction policy, though not
+to an identical pipeline: drafts keep the streaming-aware sanitizer, which holds
+back protocol prefixes that a later delta may complete.
+
+Teams still offers `off` and `partial` only. The paragraph-split path stays
+withdrawn as a matter of scope, not safety: reintroducing it is a
+delivery-behavior change that deserves its own review rather than arriving as a
+side effect of the redaction fix.
 
 The withdrawal costs Teams nothing that `partial` already provides in a
 personal chat, and removes the only way to show progress inside a team channel,

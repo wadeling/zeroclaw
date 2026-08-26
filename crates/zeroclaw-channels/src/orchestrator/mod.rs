@@ -3847,9 +3847,19 @@ async fn run_draft_updater(
     reply_target: String,
     draft_id: String,
     known_tool_names: HashSet<String>,
+    config: Arc<Config>,
+    content_format: OutboundContentFormat,
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::DraftEvent>,
 ) {
     use zeroclaw_runtime::agent::loop_::StreamDelta;
+    // The final-response path redacts too, but it runs after a draft frame has
+    // already been displayed, and neither the closing edit nor a cancel can
+    // retract what a reader has seen. A credential the model emits across
+    // several deltas therefore has to be caught on the frame that renders it.
+    let redacted = |text: &str| -> String {
+        let sanitized = sanitize_streaming_draft_text(text, &known_tool_names);
+        redact_channel_outbound_leaks(&sanitized, &config.security.leak_detection, content_format)
+    };
     let mut accumulated = String::new();
     while let Some(event) = rx.recv().await {
         match event {
@@ -3869,7 +3879,7 @@ async fn run_draft_updater(
                 }
             }
             StreamDelta::Status(text) => {
-                let visible = sanitize_streaming_draft_text(&text, &known_tool_names);
+                let visible = redacted(&text);
                 if let Err(e) = channel
                     .update_draft_progress(&reply_target, &draft_id, &visible)
                     .await
@@ -3888,7 +3898,7 @@ async fn run_draft_updater(
             // `run_matrix_single_message_draft_updater`.
             event @ (StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. }) => {
                 if let Some(text) = event.legacy_status() {
-                    let visible = sanitize_streaming_draft_text(&text, &known_tool_names);
+                    let visible = redacted(&text);
                     if let Err(e) = channel
                         .update_draft_progress(&reply_target, &draft_id, &visible)
                         .await
@@ -3911,7 +3921,7 @@ async fn run_draft_updater(
             StreamDelta::Reasoning(_) => {}
             StreamDelta::Text(text) => {
                 accumulated.push_str(&text);
-                let visible = sanitize_streaming_draft_text(&accumulated, &known_tool_names);
+                let visible = redacted(&accumulated);
                 if let Err(e) = channel
                     .update_draft(&reply_target, &draft_id, &visible)
                     .await
@@ -6788,8 +6798,22 @@ async fn process_channel_message_body(
                     .iter()
                     .map(|tool| tool.name().to_ascii_lowercase())
                     .collect();
+                // Same leak-detection policy and format the final sanitizer
+                // applies, so a draft frame is redacted to the same standard as
+                // the message that replaces it.
+                let draft_config = Arc::clone(&ctx.prompt_config);
+                let content_format = outbound_content_format_for_channel(&msg.channel);
                 Some(zeroclaw_spawn::spawn!(async move {
-                    run_draft_updater(channel, reply_target, draft_id, known_tool_names, rx).await;
+                    run_draft_updater(
+                        channel,
+                        reply_target,
+                        draft_id,
+                        known_tool_names,
+                        draft_config,
+                        content_format,
+                        rx,
+                    )
+                    .await;
                 }))
             }
         } else {
@@ -32866,15 +32890,24 @@ Done."#;
 
     // ── Streaming draft scratchpad sanitization ───────────────────────────
     //
-    // Drafts bypass `sanitize_channel_response_for_format_with_leak_detection`
-    // entirely (`update_draft` posts straight to the transport), so these pin
-    // the draft boundary to the same preservation contract as final delivery.
+    // Drafts do not reach
+    // `sanitize_channel_response_for_format_with_leak_detection` (`update_draft`
+    // posts straight to the transport), so `run_draft_updater` runs the same two
+    // passes itself and these pin the draft boundary to the same preservation
+    // contract as final delivery.
 
     /// An empty tool registry, which is what the parity assertions against
     /// `sanitize_channel_response(text, &[])` require: both boundaries must be
     /// judging the same inventory for the comparison to mean anything.
     fn no_tools() -> HashSet<String> {
         HashSet::new()
+    }
+
+    /// Config for the draft-updater call sites that are asserting scratchpad
+    /// stripping rather than redaction. Leak detection defaults to enabled, so
+    /// this is the production policy, not a bypass.
+    fn draft_config() -> Arc<Config> {
+        Arc::new(Config::default())
     }
 
     /// The reported leak: a `<tool_result>` envelope reaching the user. Both
@@ -33076,6 +33109,8 @@ Done."#;
             "chat-1".to_string(),
             "draft-1".to_string(),
             no_tools(),
+            draft_config(),
+            OutboundContentFormat::Markdown,
             rx,
         )
         .await;
@@ -33099,6 +33134,63 @@ Done."#;
             progress.as_slice(),
             ["Working on it.".to_string()],
             "status text must reach the transport already stripped of reasoning"
+        );
+    }
+
+    /// Production-boundary proof for draft redaction. No single delta looks like
+    /// a credential; only the accumulated text does. The final sanitizer cannot
+    /// cover this case, because by the time it runs the frame carrying the
+    /// assembled secret has already been displayed, and neither the closing edit
+    /// nor a cancel can retract what a reader saw.
+    #[tokio::test]
+    async fn draft_updater_redacts_a_credential_assembled_across_deltas() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        // The same shape `leak_only_guard_still_detects_credential_in_raw_file_uri`
+        // pins, so this test fails on the wiring rather than on detector tuning.
+        const SECRET: &str = "aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+
+        for delta in [
+            "Cron output: file:///tmp/report.md?to",
+            "ken=aB3xK9mW2p",
+            "Q7vL4nR8sT1yU6hD0jF5cG",
+            " Grab it soon.",
+        ] {
+            tx.send(StreamDelta::Text(delta.to_string())).await.unwrap();
+        }
+        drop(tx);
+
+        run_draft_updater(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            draft_config(),
+            OutboundContentFormat::Markdown,
+            rx,
+        )
+        .await;
+
+        let drafts = channel_impl.draft_updates.lock().await;
+        assert!(!drafts.is_empty(), "the transport must have been called");
+        for (i, text) in drafts.iter().enumerate() {
+            assert!(
+                !text.contains(SECRET),
+                "draft update {i} carried the assembled credential: {text:?}"
+            );
+        }
+        let last = drafts.last().unwrap();
+        assert!(
+            last.contains("[REDACTED"),
+            "the frame carrying the credential must be redacted: {last:?}"
+        );
+        assert!(
+            last.contains("file:///tmp/report.md?"),
+            "redaction must leave the surrounding text intact: {last:?}"
         );
     }
 
@@ -33136,6 +33228,8 @@ Done."#;
             "chat-1".to_string(),
             "draft-1".to_string(),
             no_tools(),
+            draft_config(),
+            OutboundContentFormat::Markdown,
             rx,
         )
         .await;
@@ -33198,6 +33292,8 @@ Done."#;
                 "chat-1".to_string(),
                 "draft-1".to_string(),
                 no_tools(),
+                draft_config(),
+                OutboundContentFormat::Markdown,
                 rx,
             )
             .await;
@@ -33265,6 +33361,8 @@ Done."#;
                 "chat-1".to_string(),
                 "draft-1".to_string(),
                 known.clone(),
+                draft_config(),
+                OutboundContentFormat::Markdown,
                 rx,
             )
             .await;
@@ -33306,6 +33404,8 @@ Done."#;
             "chat-1".to_string(),
             "draft-1".to_string(),
             known,
+            draft_config(),
+            OutboundContentFormat::Markdown,
             rx,
         )
         .await;
