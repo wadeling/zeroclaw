@@ -552,6 +552,20 @@ wide and the cost is that turn streaming nothing; holding the slot until the
 request returned would instead risk keeping it forever whenever the request
 failed, which is the outcome the ordering is chosen against.
 
+The reverse interleaving has its own window. An opening activity's `streamId`
+does not exist until Teams returns it, so a finalize, cancel or sweep landing
+while that request is outstanding reads `stream_id` as `None` and correctly
+concludes there is nothing to take down. The id then comes back to a draft that
+is gone. `push_stream_activity` closes that stream itself, because the value it
+holds at that moment is the only reference to it anywhere in the process: a
+bubble left there could not be closed by any later call, and Teams would render
+it, Stop button included, until the session limit expired. The cleanup does not
+depend on which path cleared the entry, and it deliberately does not reinstate
+the entry — the draft was abandoned, and the chat's stream slot belongs to
+whatever replaced it. For the same reason that frame records no pacing
+timestamp: an interval floor outlives the draft it was set for, and a successor
+turn would otherwise inherit a floor it never set.
+
 ### `multi_message` is not offered
 
 `stream_mode = "multi_message"` splits an answer into one message per

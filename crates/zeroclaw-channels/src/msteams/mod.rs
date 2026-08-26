@@ -896,6 +896,12 @@ impl MsTeamsChannel {
     /// status or response text. The sequence counter (and, on open, the
     /// Teams-assigned `streamId`) is committed only after the request
     /// succeeds, so a failed open retries as sequence 1.
+    ///
+    /// Committing afterwards means the draft can be finalized, cancelled or
+    /// swept while the open is in flight. Because the id does not exist until
+    /// the response carries it, that cleanup has nothing to close, so this
+    /// method takes the stream down itself rather than leaving a bubble no
+    /// handle refers to.
     async fn push_stream_activity(
         &self,
         recipient: &str,
@@ -932,20 +938,67 @@ impl MsTeamsChannel {
         )
         .await?;
 
-        if let Some(draft) = self.draft_streams.lock().get_mut(draft_id) {
-            if draft.stream_id.is_none() {
-                draft.stream_id = Some(
-                    response_id
-                        .context("Teams streaming draft opened but no streamId was returned")?,
-                );
-            }
-            draft.next_sequence = sequence + 1;
-            if stream_type == "streaming" {
-                draft.content_started = true;
-                text.clone_into(&mut draft.streamed);
+        // Only this call can know a stream was opened, because the id exists
+        // nowhere until the response carries it back.
+        let opened_here = stream_id.is_none();
+        let mut orphan: Option<String> = None;
+        let mut still_owned = false;
+        {
+            let mut drafts = self.draft_streams.lock();
+            match drafts.get_mut(draft_id) {
+                Some(draft) => {
+                    still_owned = true;
+                    if draft.stream_id.is_none() {
+                        draft.stream_id = Some(response_id.context(
+                            "Teams streaming draft opened but no streamId was returned",
+                        )?);
+                    }
+                    draft.next_sequence = sequence + 1;
+                    if stream_type == "streaming" {
+                        draft.content_started = true;
+                        text.clone_into(&mut draft.streamed);
+                    }
+                }
+                // Finalize, cancel or the sweep took the draft while this
+                // request was in flight. Whichever it was read `stream_id` as
+                // `None` and so had nothing to take down, which leaves the
+                // bubble this call just opened tracked nowhere: this is the
+                // only place its id is ever held. Closing it does not depend on
+                // knowing which path cleared the entry.
+                None => orphan = if opened_here { response_id } else { None },
             }
         }
-        self.mark_draft_update(recipient);
+
+        if let Some(id) = orphan {
+            // `INFO`, not `DEBUG`: a stream now exists on the service, and this
+            // is the only record that it was created and then withdrawn.
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"stream_id": id})),
+                "Teams draft was taken while its stream opened; closing the orphaned bubble"
+            );
+            // A final message has to carry what the bubble already showed, and
+            // an informative frame is not that content, matching what
+            // `cancel_draft` hands to the same call.
+            let stream = OpenedStream {
+                id,
+                streamed: if stream_type == "streaming" {
+                    text.to_string()
+                } else {
+                    String::new()
+                },
+            };
+            return Self::close_stream_activity(&ctx, &stream, &Self::cancelled_notice()).await;
+        }
+
+        // Pacing is the owned draft's interval floor, and cancel and finalize
+        // drop it with the draft. Recording one for a draft that is already
+        // gone — whether or not there was a stream left to close above — would
+        // hand a successor turn a floor it never set.
+        if still_owned {
+            self.mark_draft_update(recipient);
+        }
         Ok(())
     }
 
@@ -3799,6 +3852,236 @@ mod tests {
             closing[0]["text"],
             MsTeamsChannel::cancelled_notice(),
             "a status line is not content, so it cannot be what the stream closes on"
+        );
+    }
+
+    /// The interleaving no sequential test reaches: a cancel that lands while
+    /// the opening POST is still in flight. The cancel reads `stream_id` as
+    /// `None`, so it has nothing to take down, and the id then comes back to a
+    /// draft that no longer exists. Left there, Teams renders a bubble whose id
+    /// is held nowhere and which therefore can never be closed.
+    #[tokio::test]
+    async fn a_stream_opened_after_its_draft_was_cancelled_is_taken_down() {
+        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
+
+        let connector = MockServer::start().await;
+        mock_token_endpoint(&connector).await;
+        // The delay is the race window: long enough that the cancel below is
+        // certain to land while this response is outstanding.
+        Mock::given(method("POST"))
+            .and(path(ACTIVITIES))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_delay(std::time::Duration::from_millis(300))
+                    .set_body_json(serde_json::json!({ "id": "stream-1" })),
+            )
+            .mount(&connector)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("{ACTIVITIES}/stream-1")))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&connector)
+            .await;
+
+        let ch = draft_channel(streaming_config(), &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("hi", "a:1conv"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (update, cancel) = tokio::join!(
+            ch.update_draft("a:1conv", &draft_id, "half an answer"),
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                ch.cancel_draft("a:1conv", &draft_id).await
+            }
+        );
+        update.unwrap();
+        cancel.unwrap();
+
+        let requests = connector.received_requests().await.unwrap();
+        let closing: Vec<serde_json::Value> = requests
+            .iter()
+            .filter(|request| request.url.path() == ACTIVITIES)
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .filter(|body: &serde_json::Value| body["type"] == "message")
+            .collect();
+        assert_eq!(
+            closing.len(),
+            1,
+            "the orphaned stream must be closed exactly once: {closing:?}"
+        );
+        assert_eq!(
+            closing[0]["text"], "half an answer",
+            "a final message has to carry what the bubble already showed"
+        );
+        assert_eq!(
+            closing[0]["entities"][0]["streamId"], "stream-1",
+            "the closing message must target the stream that was actually opened"
+        );
+
+        assert!(
+            ch.draft_streams.lock().is_empty(),
+            "the cancelled draft must not be resurrected by the late response"
+        );
+        assert!(
+            ch.last_draft_update.lock().is_empty(),
+            "a draft that no longer exists must not leave a pacing floor behind for the next turn"
+        );
+
+        // The freed slot is the point of cancelling: the successor keeps its own
+        // state rather than inheriting anything from the draft that was taken.
+        let successor = ch
+            .send_draft(&SendMessage::new("hi again", "a:1conv"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(successor, draft_id);
+        let drafts = ch.draft_streams.lock();
+        assert_eq!(drafts.len(), 1);
+        let draft = drafts.get(&successor).expect("successor draft is tracked");
+        assert!(
+            draft.stream_id.is_none(),
+            "the successor must start with no stream of its own"
+        );
+        assert_eq!(draft.next_sequence, 1);
+    }
+
+    /// The other half of that interleaving: the stream was already open, so
+    /// the cancel could see it and closed it properly, and the late frame has
+    /// no bubble to clean up. What it must still not do is record a pacing
+    /// floor, because the draft that floor belonged to is gone and the next
+    /// turn would start against an interval it never set.
+    #[tokio::test]
+    async fn a_frame_landing_after_its_draft_was_cancelled_leaves_no_pacing_floor() {
+        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
+
+        let connector = MockServer::start().await;
+        mock_token_endpoint(&connector).await;
+        Mock::given(method("POST"))
+            .and(path(ACTIVITIES))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_delay(std::time::Duration::from_millis(300))
+                    .set_body_json(serde_json::json!({ "id": "stream-1" })),
+            )
+            .mount(&connector)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("{ACTIVITIES}/stream-1")))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&connector)
+            .await;
+
+        let ch = draft_channel(streaming_config(), &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("hi", "a:1conv"))
+            .await
+            .unwrap()
+            .unwrap();
+        // Opens the stream, so the cancel below has something to take down and
+        // the racing frame is not the one that opened it.
+        ch.update_draft("a:1conv", &draft_id, "first")
+            .await
+            .unwrap();
+        assert!(!ch.last_draft_update.lock().is_empty());
+
+        let (update, cancel) = tokio::join!(
+            ch.update_draft("a:1conv", &draft_id, "first and second"),
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                ch.cancel_draft("a:1conv", &draft_id).await
+            }
+        );
+        update.unwrap();
+        cancel.unwrap();
+
+        assert!(
+            ch.draft_streams.lock().is_empty(),
+            "the cancelled draft must not be resurrected by the late frame"
+        );
+        assert!(
+            ch.last_draft_update.lock().is_empty(),
+            "the cancel dropped this chat's pacing floor and the late frame must not restore it"
+        );
+    }
+
+    /// The same interleaving under a finalize rather than a cancel. This one
+    /// also has a real answer to deliver, so the takedown of the stream the
+    /// finalize could not see must not cost or duplicate that answer.
+    #[tokio::test]
+    async fn a_stream_opened_after_its_draft_was_finalized_is_taken_down() {
+        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
+
+        let connector = MockServer::start().await;
+        mock_token_endpoint(&connector).await;
+        Mock::given(method("POST"))
+            .and(path(ACTIVITIES))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_delay(std::time::Duration::from_millis(300))
+                    .set_body_json(serde_json::json!({ "id": "stream-1" })),
+            )
+            .mount(&connector)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("{ACTIVITIES}/stream-1")))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&connector)
+            .await;
+
+        let ch = draft_channel(streaming_config(), &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("hi", "a:1conv"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (update, finalize) = tokio::join!(
+            ch.update_draft("a:1conv", &draft_id, "half an answer"),
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                ch.finalize_draft("a:1conv", &draft_id, "the whole answer", false)
+                    .await
+            }
+        );
+        update.unwrap();
+        finalize.unwrap();
+
+        let requests = connector.received_requests().await.unwrap();
+        let messages: Vec<serde_json::Value> = requests
+            .iter()
+            .filter(|request| request.url.path() == ACTIVITIES)
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .filter(|body: &serde_json::Value| body["type"] == "message")
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|body| body["text"] == "the whole answer"),
+            "the answer the turn produced must still be delivered: {messages:?}"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|body| body["entities"][0]["streamId"] == "stream-1")
+                .count(),
+            1,
+            "the orphaned stream must be closed exactly once: {messages:?}"
+        );
+        assert!(
+            ch.draft_streams.lock().is_empty(),
+            "the finalized draft must not be resurrected by the late response"
         );
     }
 
