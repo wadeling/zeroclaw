@@ -13206,6 +13206,29 @@ pub async fn deliver_announcement(
         "whatsapp" | "whatsapp-web" | "whatsapp_web" => {
             anyhow::bail!("WhatsApp channel requires the `whatsapp-web` feature");
         }
+        #[cfg(feature = "channel-msteams")]
+        "msteams" => {
+            let ms = config
+                .channels
+                .msteams
+                .get(alias)
+                .ok_or_else(not_configured)?
+                .clone();
+            // One-shot delivery from a `&Config`, so the resolver serves this
+            // snapshot rather than reading a live handle the caller does not
+            // have. The listening channel keeps its own live resolver.
+            let config_resolver: crate::msteams::ConfigResolver =
+                Arc::new(move || Some(ms.clone()));
+            let peers = config.channel_external_peers("msteams", alias);
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || peers.clone());
+            let ch = MsTeamsChannel::new(alias.to_string(), config_resolver, peer_resolver);
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "channel-msteams"))]
+        "msteams" => {
+            anyhow::bail!("Microsoft Teams channel requires the `channel-msteams` feature");
+        }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
     #[allow(unreachable_code)]
@@ -33910,6 +33933,37 @@ Done."#;
         assert!(
             msg.contains("[channels.email.default] not configured"),
             "email.default must report the real config table; got: {msg}"
+        );
+    }
+
+    /// `msteams` is in `CRON_DELIVERY_SCHEMA_CHANNELS` and cron delivery refs are
+    /// dotted, but `build_channel_by_id` claims only the bare name and hands the
+    /// dotted form here. A daemon resolves it through the live registry; a
+    /// one-shot process has no registry and reaches this match, where a missing
+    /// arm reported `unsupported delivery channel` for a channel the schema
+    /// advertises.
+    ///
+    /// Routing is all this arm can be held to. A fresh channel carries no
+    /// conversation references, so the send that follows still fails, by design:
+    /// Teams learns a `serviceUrl` only from an inbound activity. The point is
+    /// that it now fails on that real constraint instead of denying the channel
+    /// exists.
+    #[tokio::test]
+    #[cfg(feature = "channel-msteams")]
+    async fn deliver_announcement_routes_msteams_to_msteams_arm() {
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = deliver_announcement(&config, "msteams.default", "a:1T0cxxxx", None, "hi")
+            .await
+            .expect_err("expected msteams.default to bail because channel is not configured");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("unsupported delivery channel"),
+            "msteams.default must route to the msteams arm, not fall through; got: {msg}"
+        );
+        assert!(
+            msg.contains("[channels.msteams.default] not configured"),
+            "msteams.default must report the real config table; got: {msg}"
         );
     }
 
