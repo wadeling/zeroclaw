@@ -105,8 +105,10 @@ carry `channel-msteams`, and it publishes the gateway port only:
 ```yaml
 services:
   zeroclaw:
-    # Replaces the `image:` line: no published tag carries the Teams channel,
-    # so the binary is built here with the feature added to the default set.
+    # Replaces the `image:` line, building the binary here with the feature
+    # added to the default set. Swapping that line for the published
+    # `all-features` tag works too; this route is for keeping the rest of the
+    # feature set lean.
     build:
       context: .
       args:
