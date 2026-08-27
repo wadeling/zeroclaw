@@ -431,9 +431,17 @@ Platform constraints, and how we handle them:
   be spent on a stream Teams refuses to start. `send_draft` therefore hands
   the second turn no draft: its answer is delivered as one ordinary message,
   the same shape a group chat already gets. The draft records its conversation
-  for this check, and ages out after the two-minute session limit so a draft
-  that some path failed to finalize or cancel cannot cost the chat its
-  streaming for the life of the process.
+  for this check, and ages out two minutes after its stream started so a
+  draft that some path failed to finalize or cancel cannot cost the chat its
+  streaming for the life of the process. The clock runs from the stream's own
+  start rather than from registration, because a stream opens lazily — often
+  a whole tool loop later — and the two instants are far enough apart to
+  matter: `message_timeout_secs` defaults to `300`, so a turn may still be
+  streaming when its draft turns two minutes old. Ageing from registration
+  would drop that entry mid-answer, and with it the only `streamId` the
+  process holds, leaving a bubble no finalize or cancel could take down.
+  A draft that never opened a stream ages from registration, since removing
+  it strands nothing on screen.
 - Updates are rate-limited (~1/s). `draft_update_interval_ms` defaults
   to `1500`, the same headroom Microsoft's own SDK buffers to; the
   orchestrator already throttles draft flushes on this interval, so no
@@ -687,7 +695,7 @@ Pre-edit ritual answers for every state-bearing field:
 | JWKS cache | Source of truth is Microsoft's JWKS endpoint; the cached copy is a runtime materialized view. Two independent bounds with separate timestamps: the last *attempt* spaces fetches at least 60s apart regardless of outcome, and the last *success* caps how long a key set may be served at 24h. A stale cache whose mandatory refresh fails or is rate-limited serves nothing. |
 | ConversationReference map | Source of truth is **created here** (delivered by Teams per activity; exists nowhere else in the codebase). In-memory `RwLock<HashMap<String, ConversationReference>>`. |
 | `bot_identity` (id/name) | Source of truth is the platform (first inbound `activity.recipient`). Write-once `std::sync::OnceLock`. `mattermost.rs::bot_identity` answers the same question with a `tokio::sync::OnceCell` because it has to await an API call to learn its own identity; Teams is handed the identity on every inbound activity, so the initialization is synchronous and an async cell would buy nothing. |
-| Draft stream state (`streamId`, `streamSequence` per in-flight draft) | Source of truth is **created here** (assigned by Teams / incremented locally per protocol). Ephemeral per-draft map, removed on finalize/cancel, and removed there whether or not anything reached the wire: nothing revisits a handle the orchestrator has fallen back on, so a preflight failure that returned early would otherwise leave the entry holding this chat's one stream slot. Since an entry is what makes `send_draft` refuse a second concurrent stream, an abandoned turn must not cost the chat the turn that replaced it. A draft that reaches neither call is swept on the next `send_draft` once it is older than the two-minute session limit, because nothing calls back into the channel on such a handle and the map would otherwise grow for the life of the process. |
+| Draft stream state (`streamId`, `streamSequence` per in-flight draft) | Source of truth is **created here** (assigned by Teams / incremented locally per protocol). Ephemeral per-draft map, removed on finalize/cancel, and removed there whether or not anything reached the wire: nothing revisits a handle the orchestrator has fallen back on, so a preflight failure that returned early would otherwise leave the entry holding this chat's one stream slot. Since an entry is what makes `send_draft` refuse a second concurrent stream, an abandoned turn must not cost the chat the turn that replaced it. A draft that reaches neither call is swept on the next `send_draft` once its stream is older than the two-minute session limit — or, if it never opened one, once its registration is — because nothing calls back into the channel on such a handle and the map would otherwise grow for the life of the process. The sweep therefore only ever drops an entry Teams has already finished with or that never reached the wire, which is what lets it stay synchronous and close nothing. |
 | Draft update pacing (last update per recipient) | Source of truth is **created here** (when this channel last edited a draft). Keyed by recipient rather than by handle, because the interval it enforces is a per-conversation Connector limit rather than a per-draft one. Only the clear that actually removed a draft drops the key: finalize clears twice around its closing request, and the next turn can open a draft in between, whose floor a second clear would otherwise discard. A key whose mark outlived its draft is swept alongside the drafts, but only once it is older than the configured interval, at which point `draft_update_allowed` already answers "allowed" for it and dropping it cannot change what any frame does. |
 | Effective `stream_mode` | Source of truth is `Config`; the accessor resolves it per call and is the one place a refused `multi_message` becomes `off`, so no caller can act on the raw value. Nothing is cached, so a reload takes effect on the next call. One delivery lifecycle owns every draft, which is why no parallel record of "which path owns this handle" exists to keep in sync. |
 

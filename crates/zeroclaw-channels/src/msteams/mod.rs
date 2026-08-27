@@ -88,13 +88,21 @@ struct DraftStream {
     /// to — which [`MsTeamsChannel::send_draft`] needs, since Teams allows
     /// only one stream per chat at a time.
     conversation: String,
-    /// When the draft was registered. A draft is normally removed on
-    /// finalize or cancel; past [`TEAMS_STREAM_SESSION_LIMIT`] Teams has
-    /// ended the stream regardless, which is what lets
-    /// [`MsTeamsChannel::sweep_expired_draft_state`] drop one that no path
-    /// ever closed — so an abandoned draft costs its chat neither streaming
-    /// nor a map entry for the life of the process.
-    opened_at: std::time::Instant,
+    /// The instant [`TEAMS_STREAM_SESSION_LIMIT`] is counted from:
+    /// registration until an activity opens the stream, then the stream's
+    /// own start. Source of truth created here — nothing else records when a
+    /// stream opened, and `stream_id` says only that one did, not how long
+    /// ago.
+    ///
+    /// A draft is normally removed on finalize or cancel; ageing is what
+    /// lets [`MsTeamsChannel::sweep_expired_draft_state`] drop one that no
+    /// path ever closed, so an abandoned draft costs its chat neither
+    /// streaming nor a map entry for the life of the process. It is re-based
+    /// on open because a stream opens lazily, often a whole tool loop after
+    /// registration: counting from registration would drop an entry whose
+    /// stream started late while that stream is still live on the service,
+    /// and this map holds the only handle to it.
+    session_started_at: std::time::Instant,
     /// Teams `streamId` — the Connector-assigned id of the first
     /// activity. `None` while the draft is lazily pending (no activity
     /// has been POSTed yet).
@@ -775,17 +783,27 @@ impl MsTeamsChannel {
     /// that is: it already walks `draft_streams` to enforce one stream per
     /// chat, and it runs once per turn rather than once per frame.
     ///
-    /// Neither removal can change behaviour. A draft past
-    /// [`TEAMS_STREAM_SESSION_LIMIT`] is one Teams has already ended, so it
-    /// is no longer eligible to hold its chat's stream slot and no callback
-    /// could do anything with the `streamId` it carries. A pacing entry
-    /// older than the configured interval is one
+    /// Neither removal can change behaviour, and that rests on ageing from
+    /// `session_started_at` rather than from registration. A draft whose
+    /// stream opened more than [`TEAMS_STREAM_SESSION_LIMIT`] ago is one
+    /// Teams has already ended, so it is no longer eligible to hold its
+    /// chat's stream slot and no callback could do anything with the
+    /// `streamId` it carries; a draft that never opened one has nothing on
+    /// screen to take down. Neither needs closing here, which is why the
+    /// sweep stays synchronous and does no I/O on the next turn's way in.
+    ///
+    /// Ageing from registration would break exactly that: because a stream
+    /// opens lazily, a draft can turn two minutes old with a stream only
+    /// seconds into its own session, and dropping it would strand a bubble —
+    /// Stop button included — that no later finalize or cancel could close,
+    /// since both read `stream_id` from the entry this removes. A pacing
+    /// entry older than the configured interval is one
     /// [`Self::draft_update_allowed`] already answers "allowed" for, and an
     /// interval of `0` makes it skip the map entirely.
     fn sweep_expired_draft_state(&self) {
         self.draft_streams
             .lock()
-            .retain(|_, draft| draft.opened_at.elapsed() < TEAMS_STREAM_SESSION_LIMIT);
+            .retain(|_, draft| draft.session_started_at.elapsed() < TEAMS_STREAM_SESSION_LIMIT);
         let interval_ms = self.config().map_or(0, |cfg| cfg.draft_update_interval_ms);
         let mut pacing = self.last_draft_update.lock();
         if interval_ms == 0 {
@@ -952,6 +970,14 @@ impl MsTeamsChannel {
                         draft.stream_id = Some(response_id.context(
                             "Teams streaming draft opened but no streamId was returned",
                         )?);
+                        // Teams' session clock starts when it accepts this
+                        // request, so the sweep ages the entry from here rather
+                        // than from registration — which a tool loop may have
+                        // left well in the past. Reading the instant after the
+                        // round trip puts the local deadline a shade behind the
+                        // service's, so the entry outlives the stream rather
+                        // than the stream outliving its only handle.
+                        draft.session_started_at = std::time::Instant::now();
                     }
                     draft.next_sequence = sequence + 1;
                     if stream_type == "streaming" {
@@ -1639,7 +1665,7 @@ impl Channel for MsTeamsChannel {
                         draft_id.clone(),
                         DraftStream {
                             conversation: base_id.to_string(),
-                            opened_at: std::time::Instant::now(),
+                            session_started_at: std::time::Instant::now(),
                             stream_id: None,
                             next_sequence: 1,
                             content_started: false,
@@ -3568,8 +3594,8 @@ mod tests {
     }
 
     /// A draft that no path ever finalized or cancelled must not cost the
-    /// chat its streaming for the life of the process: past Teams' own
-    /// two-minute session limit the stale stream is dead anyway.
+    /// chat its streaming for the life of the process. This one never opened
+    /// a stream, so there is nothing on screen for the removal to strand.
     #[tokio::test]
     async fn a_draft_older_than_the_session_limit_stops_blocking_the_chat() {
         let connector = MockServer::start().await;
@@ -3590,7 +3616,11 @@ mod tests {
         );
 
         if let Some(draft) = ch.draft_streams.lock().get_mut(&stale) {
-            draft.opened_at = std::time::Instant::now() - TEAMS_STREAM_SESSION_LIMIT;
+            assert!(
+                draft.stream_id.is_none(),
+                "no frame was pushed, so this draft holds no stream"
+            );
+            draft.session_started_at = std::time::Instant::now() - TEAMS_STREAM_SESSION_LIMIT;
         }
         let successor = ch
             .send_draft(&SendMessage::new("later", "a:1conv"))
@@ -3609,6 +3639,77 @@ mod tests {
             "the abandoned draft must leave the map, not merely stop counting"
         );
         assert_eq!(drafts.len(), 1, "only the successor may remain");
+    }
+
+    /// A stream opens lazily, so a draft can pass Teams' session limit while
+    /// its stream is seconds old. The sweep runs on any chat's next turn and
+    /// walks every entry, so ageing from registration would drop this one
+    /// mid-answer — and with it the only `streamId` anyone holds, leaving a
+    /// bubble and its Stop button that no finalize or cancel could take down.
+    #[tokio::test]
+    async fn a_sweep_spares_a_draft_whose_stream_opened_late() {
+        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
+
+        let connector = MockServer::start().await;
+        mock_token_endpoint(&connector).await;
+        Mock::given(method("POST"))
+            .and(path(ACTIVITIES))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": "stream-1"
+            })))
+            .mount(&connector)
+            .await;
+        // The point of sparing the entry: the handle it carries still works.
+        Mock::given(method("DELETE"))
+            .and(path(format!("{ACTIVITIES}/stream-1")))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&connector)
+            .await;
+
+        let ch = draft_channel(streaming_config(), &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
+        record_reference(&ch, &connector, "b:1conv", "personal");
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("hi", "a:1conv"))
+            .await
+            .unwrap()
+            .unwrap();
+        // A tool loop long enough to outlast the session limit before the
+        // first frame goes out. `message_timeout_secs` defaults to 300, well
+        // past the two minutes, so a turn is allowed to reach this.
+        if let Some(draft) = ch.draft_streams.lock().get_mut(&draft_id) {
+            draft.session_started_at = std::time::Instant::now() - TEAMS_STREAM_SESSION_LIMIT;
+        }
+        ch.update_draft("a:1conv", &draft_id, "half an answer")
+            .await
+            .unwrap();
+
+        // Another chat's turn, which is all it takes to sweep the whole map.
+        assert!(
+            ch.send_draft(&SendMessage::new("hi", "b:1conv"))
+                .await
+                .unwrap()
+                .is_some(),
+            "an unrelated chat is free to stream"
+        );
+
+        {
+            let drafts = ch.draft_streams.lock();
+            let spared = drafts
+                .get(&draft_id)
+                .expect("a draft whose stream just opened is still live");
+            assert_eq!(
+                spared.stream_id.as_deref(),
+                Some("stream-1"),
+                "the spared entry keeps the handle its stream needs"
+            );
+        }
+
+        // Proves the handle survived in usable form, not merely that a map
+        // key did: this is the takedown the dropped entry would have lost.
+        ch.cancel_draft("a:1conv", &draft_id).await.unwrap();
     }
 
     /// The pacing map is keyed by recipient and cleared only by the draft
