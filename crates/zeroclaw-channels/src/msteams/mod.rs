@@ -2764,6 +2764,111 @@ mod tests {
         assert!(ch.draft_streams.lock().is_empty());
     }
 
+    /// What actually reached Teams, for a credential the model assembles
+    /// across deltas. The withholding that keeps a raw prefix off the wire
+    /// runs at the shared draft boundary, so this drives the real
+    /// [`crate::orchestrator::run_draft_updater`] into a real channel and
+    /// reads the request bodies the Connector received, rather than asserting
+    /// on text a test wrote itself.
+    ///
+    /// Two properties, and the frames have to carry both at once: no frame
+    /// may publish even the leading characters of the value, because a frame
+    /// cannot be retracted once read, and every frame must contain the one
+    /// before it, because Teams rejects a stream that goes backwards. Late
+    /// redaction alone satisfies the second only by violating the first.
+    #[tokio::test]
+    async fn msteams_stream_never_carries_a_raw_credential_prefix() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        // Long enough to match the detector's keyed `api_key` pattern only
+        // once fully assembled, which is the whole difficulty: the deltas
+        // that build it arrive before any of them looks like a credential.
+        const SECRET: &str = "aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+
+        let connector = MockServer::start().await;
+        mock_token_endpoint(&connector).await;
+        Mock::given(method("POST"))
+            .and(path("/teams/v3/conversations/a:1conv/activities"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
+            )
+            .mount(&connector)
+            .await;
+
+        let ch = draft_channel(streaming_config(), &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
+        let draft_id = ch
+            .send_draft(&SendMessage::new("...", "a:1conv"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ch);
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        // The split falls inside the value, so the first delta ends on a
+        // prefix the detector cannot yet recognise.
+        for delta in [
+            "Store it as api_key=aB3xK9mW2p",
+            "Q7vL4nR8sT1yU6hD0jF5cG",
+            " and rotate it after the demo.",
+        ] {
+            tx.send(StreamDelta::Text(delta.to_string())).await.unwrap();
+        }
+        drop(tx);
+
+        crate::orchestrator::run_draft_updater(
+            Arc::clone(&channel),
+            "a:1conv".to_string(),
+            draft_id,
+            std::collections::HashSet::new(),
+            Arc::new(zeroclaw_config::schema::Config::default()),
+            crate::orchestrator::OutboundContentFormat::Markdown,
+            rx,
+        )
+        .await;
+
+        let requests = connector.received_requests().await.unwrap();
+        let frames: Vec<String> = requests
+            .iter()
+            .filter(|r| r.url.path().ends_with("/activities"))
+            .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+            .filter(|body| body["entities"][0]["streamType"] == "streaming")
+            .map(|body| body["text"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            !frames.is_empty(),
+            "the Connector must have received streaming frames"
+        );
+
+        let mut previous = String::new();
+        for (i, text) in frames.iter().enumerate() {
+            assert!(
+                !text.contains(SECRET),
+                "frame {i} carried the assembled credential: {text:?}"
+            );
+            assert!(
+                !text.contains(&SECRET[..8]),
+                "frame {i} published a raw prefix of the credential: {text:?}"
+            );
+            assert!(
+                text.starts_with(&previous),
+                "frame {i} does not contain the frame before it: \
+                 {text:?} after {previous:?}"
+            );
+            previous.clone_from(text);
+        }
+
+        let last = frames.last().unwrap();
+        assert!(
+            last.contains("[REDACTED"),
+            "the value must reach the wire redacted, not merely withheld: {last:?}"
+        );
+        assert!(
+            last.contains("rotate it after the demo"),
+            "withholding must release the text that follows the value: {last:?}"
+        );
+    }
+
     /// Teams refuses a final message that does not extend the content
     /// already streamed, which a tool loop hits whenever its answer is not
     /// a continuation of an earlier text segment. The caller resends the

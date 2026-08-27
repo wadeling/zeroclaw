@@ -3842,7 +3842,7 @@ fn truncate_at_unclosed_protocol_fence(s: &str, known_tool_names: &HashSet<Strin
 ///
 /// `known_tool_names` comes from the same registry the final sanitizer reads,
 /// so both boundaries judge a protocol payload by the same tool inventory.
-async fn run_draft_updater(
+pub(crate) async fn run_draft_updater(
     channel: Arc<dyn Channel>,
     reply_target: String,
     draft_id: String,
@@ -4011,7 +4011,7 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutboundContentFormat {
+pub(crate) enum OutboundContentFormat {
     Markdown,
     PlainText,
 }
