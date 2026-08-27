@@ -3921,7 +3921,26 @@ async fn run_draft_updater(
             StreamDelta::Reasoning(_) => {}
             StreamDelta::Text(text) => {
                 accumulated.push_str(&text);
-                let visible = redacted(&accumulated);
+                // A detector needs enough of a value to recognise it, so the
+                // deltas that build one arrive before any of them looks like a
+                // credential. Publishing the accumulation as it stands would
+                // render that prefix, and a frame cannot be retracted: the
+                // closing edit replaces what is on screen, not what was read.
+                // Holding the pending tail also keeps frames monotonic, since
+                // the redacted value extends the text already shown instead of
+                // contradicting it, which is what Teams requires of a stream.
+                let publishable =
+                    match zeroclaw_runtime::security::incomplete_credential_tail(&accumulated) {
+                        Some(offset) => &accumulated[..offset],
+                        None => accumulated.as_str(),
+                    };
+                // Nothing to show yet rather than an empty bubble: the tail is
+                // all there is, and the next delta either completes it or ends
+                // it.
+                if publishable.is_empty() {
+                    continue;
+                }
+                let visible = redacted(publishable);
                 if let Err(e) = channel
                     .update_draft(&reply_target, &draft_id, &visible)
                     .await
@@ -33357,11 +33376,29 @@ Done."#;
 
         let drafts = channel_impl.draft_updates.lock().await;
         assert!(!drafts.is_empty(), "the transport must have been called");
+        let mut previous = String::new();
         for (i, text) in drafts.iter().enumerate() {
             assert!(
                 !text.contains(SECRET),
                 "draft update {i} carried the assembled credential: {text:?}"
             );
+            // The frame that renders a partial value is the exposure: a
+            // detector needs the whole thing, and by the time the closing edit
+            // redacts it a reader has already seen it. Asserting only on the
+            // last frame proves the value was redacted eventually, not that no
+            // frame showed it.
+            assert!(
+                !text.contains(&SECRET[..8]),
+                "draft update {i} published a raw prefix of the credential: {text:?}"
+            );
+            // Teams rejects a frame that does not contain the one before it,
+            // and withholding a pending value must not retract published text.
+            assert!(
+                text.starts_with(&previous),
+                "draft update {i} does not contain the frame before it: \
+                 {text:?} after {previous:?}"
+            );
+            previous = text.clone();
         }
         let last = drafts.last().unwrap();
         assert!(

@@ -613,6 +613,41 @@ Drafts and final delivery are now held to the same redaction policy, though not
 to an identical pipeline: drafts keep the streaming-aware sanitizer, which holds
 back protocol prefixes that a later delta may complete.
 
+Redacting each frame is not sufficient on its own, because a detector needs
+enough of a value to recognise it. `token=` followed by ten characters is below
+the twenty the pattern requires, so the frame carrying it is clean by the
+detector's own reckoning and goes out raw; the frame after it, once the value is
+complete, carries `[REDACTED_SECRET]` instead. Two consequences follow. The
+reader has already seen ten characters of the credential, and no later edit
+retracts that. And the redacted frame no longer contains the text of the frame
+before it, so Teams rejects it — the handled rejection above, but spent on a
+frame that had no reason to fail.
+
+`run_draft_updater` therefore publishes only text that a later delta cannot turn
+into a credential, asking `incomplete_credential_tail` where the pending region
+begins and holding from there. The withheld text is not lost: the next frame
+publishes it once the value either completes, in which case the detector's
+replacement covers it, or becomes something a pattern can no longer match. This
+keeps frames monotonic by construction, since the replacement extends the text
+already shown rather than contradicting it.
+
+The keys are matched while they are still arriving, not only once complete. A
+provider breaks deltas wherever it likes, so `token` reaches the boundary as
+`to` and then `ken=`; withholding from a finished key alone would publish `to`
+and retract it one frame later, which is the same protocol violation by another
+route. The cost is that text ending on a prefix of one of these keys waits for
+the delta that decides the word, bounded by the longest key and released as soon
+as the word cannot be one.
+
+The residual boundary is a credential no key announces — a bare high-entropy
+token, a JWT. Withholding every long unbroken run would hold back ordinary text
+such as a URL or a hash, and those detectors are heuristic rather than keyed, so
+this path still renders them until enough of the value arrives for the heuristic
+to fire. `incomplete_credential_tail` lives beside the detector's patterns
+because it depends on their thresholds, and
+`withhold_thresholds_match_the_detector_patterns` fails if a pattern's length
+requirement moves without this table following it.
+
 Teams still offers `off` and `partial` only. The paragraph-split path stays
 withdrawn as a matter of scope, not safety: reintroducing it is a
 delivery-behavior change that deserves its own review rather than arriving as a

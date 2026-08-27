@@ -239,9 +239,14 @@ cannot recall a message once sent, so the mode needs a review of its own rather
 than arriving alongside unrelated work. Teams offers `off` and `partial` only.
 
 Draft text is redacted under `security.leak_detection` before each update
-reaches Teams, using the same policy applied to a final reply. This covers a
-credential the model emits across several streaming chunks, where no single
-chunk looks like a secret.
+reaches Teams, using the same policy applied to a final reply. Redaction alone
+is not enough for a credential the model emits across several streaming chunks,
+because the detector needs enough of the value to recognise it and the chunks
+before that point look clean. Text that could still become one of the
+credentials these patterns name is therefore held back rather than published,
+and released on the update that either completes the value, which is redacted,
+or rules it out. A credential no key announces, such as a bare high-entropy
+token, is still shown until enough of it arrives for the heuristic to fire.
 
 Group chats show the ordinary typing indicator while the turn runs, at any
 setting. Team channels show no indicator at all, because Teams has none in a
