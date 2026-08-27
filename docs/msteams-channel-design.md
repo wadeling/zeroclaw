@@ -430,7 +430,14 @@ Platform constraints, and how we handle them:
   would open a stream in the same chat, and the second one's frames would all
   be spent on a stream Teams refuses to start. `send_draft` therefore hands
   the second turn no draft: its answer is delivered as one ordinary message,
-  the same shape a group chat already gets. The draft records its conversation
+  the same shape a group chat already gets. Declining is a handle the channel
+  does not return, not a capability it withdraws, so the orchestrator keys the
+  rest of the turn on that handle: no delta sink is handed to the runtime, and
+  the typing indicator and tool notifications a draft would have replaced stay
+  on. Keyed on the capability instead, such a turn would run with a sink whose
+  updater was never spawned, and would show nothing at all until its answer
+  landed. Any channel reaches this state when `send_draft` fails transiently,
+  so the correction is not Teams-specific. The draft records its conversation
   for this check, and ages out two minutes after its stream started so a
   draft that some path failed to finalize or cancel cannot cost the chat its
   streaming for the life of the process. The clock runs from the stream's own

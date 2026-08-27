@@ -6761,6 +6761,20 @@ async fn process_channel_message_body(
         None
     };
 
+    // A channel can decline a draft it is capable of, so capability is not the
+    // decision — the returned handle is. Teams allows one stream per chat, so a
+    // second concurrent turn in the same conversation is handed `None` by
+    // design, and any channel's transient `send_draft` failure arrives here as
+    // `None` too. Such a turn is an ordinary non-streaming turn, and the sink
+    // goes with the handle: the runtime skips its draft sends outright rather
+    // than discovering a closed channel one failed send at a time, and nothing
+    // downstream has to re-derive a decision already made here.
+    let (delta_tx, delta_rx) = if draft_message_id.is_some() {
+        (delta_tx, delta_rx)
+    } else {
+        (None, None)
+    };
+
     // Spawn the appropriate handler for the delta channel.
     let draft_updater = if use_draft_streaming {
         // Partial: accumulate text and edit a single draft message.
@@ -6844,10 +6858,16 @@ async fn process_channel_message_body(
     // scope before its first visible draft delivery. The per-message form of
     // the capability check keeps a channel whose draft support depends on the
     // conversation (Teams streams in 1:1 chats only) on the typing path for
-    // the conversations where it opens no draft.
-    let is_partial_draft = target_channel.as_ref().is_some_and(|ch| {
-        ch.supports_draft_updates_for(&msg) && !ch.supports_multi_message_streaming()
-    }) || matrix_single_message_streaming;
+    // the conversations where it opens no draft. The handle carries the rest:
+    // a turn the channel declined a draft for shows nothing while it runs, so
+    // keying this on capability alone would suppress typing and tool
+    // notifications for a conversation that would have had a draft but did
+    // not, leaving it silent until the answer lands.
+    let is_partial_draft = (draft_message_id.is_some()
+        && target_channel.as_ref().is_some_and(|ch| {
+            ch.supports_draft_updates_for(&msg) && !ch.supports_multi_message_streaming()
+        }))
+        || matrix_single_message_streaming;
     let typing_controller = if is_partial_draft {
         None
     } else {
@@ -16609,6 +16629,10 @@ api_key = "anthropic-key"
         /// what the transport actually received rather than on a sanitizer it
         /// called itself. Progress text lands in `progress_messages`.
         draft_updates: tokio::sync::Mutex<Vec<String>>,
+        /// Report draft support but hand back no handle, which is what Teams
+        /// does for a second concurrent turn in a chat whose one stream is
+        /// taken, and what any channel does when `send_draft` fails.
+        decline_draft: bool,
     }
 
     struct ExpiringTypingChannel {
@@ -16638,6 +16662,15 @@ api_key = "anthropic-key"
                 stall_start_typing: false,
                 stall_stop_typing: false,
                 draft_updates: tokio::sync::Mutex::new(Vec::new()),
+                decline_draft: false,
+            }
+        }
+
+        /// Draft-capable, but declines the draft it is asked for.
+        fn declining_drafts() -> Self {
+            Self {
+                decline_draft: true,
+                ..Self::new(false, false)
             }
         }
 
@@ -17007,6 +17040,9 @@ api_key = "anthropic-key"
                 .lock()
                 .await
                 .push(format!("{}:{}", message.recipient, message.content));
+            if self.decline_draft {
+                return Ok(None);
+            }
             Ok(Some("draft-1".to_string()))
         }
 
@@ -18193,6 +18229,127 @@ api_key = "anthropic-key"
         fn alias(&self) -> &str {
             "SlowModelProvider"
         }
+    }
+
+    /// Streams far more text deltas than the draft queue holds, so a turn that
+    /// was offered a draft and handed none has to finish without one.
+    struct ManyDeltaStreamingModelProvider {
+        deltas: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ManyDeltaStreamingModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(self.answer())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_api::model_provider::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_api::model_provider::StreamResult<zeroclaw_api::model_provider::StreamChunk>,
+        > {
+            use futures_util::StreamExt;
+            let deltas = self.deltas;
+            futures_util::stream::iter((0..deltas).map(move |index| {
+                Ok(zeroclaw_api::model_provider::StreamChunk {
+                    delta: format!("d{index} "),
+                    reasoning: None,
+                    is_final: index + 1 == deltas,
+                    token_count: 1,
+                })
+            }))
+            .boxed()
+        }
+    }
+
+    impl ManyDeltaStreamingModelProvider {
+        fn answer(&self) -> String {
+            (0..self.deltas).map(|index| format!("d{index} ")).collect()
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ManyDeltaStreamingModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ManyDeltaStreamingModelProvider"
+        }
+    }
+
+    /// A channel can report draft support and still decline the draft, which is
+    /// what Teams does for a second concurrent turn in a chat whose single
+    /// stream is already taken, and what any channel does when `send_draft`
+    /// fails. Such a turn is an ordinary one: the delta sink has to go with the
+    /// handle rather than the capability, or the runtime spends the turn
+    /// sending into a queue nobody drains.
+    #[tokio::test]
+    async fn a_turn_whose_draft_was_declined_completes_as_an_ordinary_message() {
+        // More than the 64-entry queue the streaming path allocates.
+        const DELTAS: usize = 200;
+
+        let channel_impl = Arc::new(DraftRecordingChannel::declining_drafts());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(ManyDeltaStreamingModelProvider { deltas: DELTAS }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            channel_impl.draft_messages.lock().await.len(),
+            1,
+            "the draft was offered once and declined"
+        );
+        assert!(
+            channel_impl.draft_updates.lock().await.is_empty(),
+            "there is no draft to update"
+        );
+        assert!(
+            channel_impl.finalized_messages.lock().await.is_empty(),
+            "there is no draft to finalize"
+        );
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent.len(),
+            1,
+            "the answer must arrive as one ordinary message, got {sent:?}"
+        );
+        assert!(
+            sent[0].ends_with(&format!("d{}", DELTAS - 1)),
+            "the ordinary message must carry the whole streamed answer: {:?}",
+            sent[0]
+        );
     }
 
     struct NoReplyModelProvider;
