@@ -512,11 +512,12 @@ impl MsTeamsChannel {
     ///
     /// `multi_message` is not offered on Teams and reads as `off` here, the
     /// same fallback Lark applies to it. Paragraph delivery publishes each
-    /// paragraph as a permanent message, and the draft boundary it would
-    /// publish from is the one the orchestrator does not run its outbound
-    /// leak policy over, so a credential in mid-answer text could reach a
-    /// message no later sanitized reply can edit or recall. That boundary is
-    /// shared with Discord and Matrix and is fixed there, not here.
+    /// paragraph as a permanent message that no later reply can edit or
+    /// recall, drawn from mid-turn draft text — a change in what delivery
+    /// means on this channel, which deserves its own review rather than
+    /// arriving alongside unrelated work. The outbound leak policy that once
+    /// argued against it now runs on every draft frame at the shared
+    /// boundary, so the refusal is a matter of scope, not safety.
     /// [`Self::listen`] names the fallback in the operator's log once at
     /// startup; clamping here rather than at startup also covers a config
     /// reload into the mode.
