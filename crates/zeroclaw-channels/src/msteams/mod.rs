@@ -70,6 +70,50 @@ struct ConnectorHandle {
     provider: Arc<auth::ConnectorTokenProvider>,
 }
 
+/// A startup failure no retry can resolve, constructed by [`MsTeamsChannel::listen`]
+/// and downcast by the orchestrator's channel supervisor. Missing credentials
+/// fail identically on every attempt, so restarting on a backoff only fills the
+/// log; the supervisor parks the listener instead and waits for a config change
+/// or shutdown. Modelled on Discord's `DiscordListenerFatalError`, and
+/// deliberately narrow: a bind conflict or an unreachable Entra endpoint is
+/// transient and stays on the retry path.
+#[derive(Debug)]
+pub(crate) struct MsTeamsListenerFatalError {
+    message: String,
+}
+
+impl MsTeamsListenerFatalError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for MsTeamsListenerFatalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for MsTeamsListenerFatalError {}
+
+/// How far a chunked reply got.
+///
+/// Teams refuses any single activity past its size limit, so a long reply goes
+/// out as several ordered ones and a failure partway through leaves the earlier
+/// ones in the chat. How many landed is what decides the caller's options:
+/// posting the reply again is only safe while none did, because the Connector
+/// takes no idempotency key and every post creates another message.
+enum ChunkedSend {
+    Delivered,
+    Failed {
+        delivered: usize,
+        total: usize,
+        error: anyhow::Error,
+    },
+}
+
 /// Resolved per-call context for outbound Connector requests.
 struct SendContext {
     reference: ConversationReference,
@@ -274,9 +318,11 @@ const CONNECTOR_RETRY_BASE_DELAY_MS: u64 = 1_000;
 /// next, and their callers already treat any error as "skip"; waiting on them
 /// would only stall the agent's token loop, which is the very cost
 /// `draft_update_interval_ms` skips updates to avoid. The finalize activity
-/// looks like the exception and is not: the orchestrator answers a failed
-/// finalize by resending the whole answer through [`Channel::send`], whose
-/// own chunks retry, so the content is already covered one layer up.
+/// looks like the exception and is not: while it has delivered nothing, the
+/// orchestrator answers a failed finalize by sending the whole answer again,
+/// so the content is covered one layer up. Once part of an oversize answer has
+/// landed that fallback is withheld, and the chunks carrying the rest are the
+/// content's only chance, so they retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ThrottlePolicy {
     /// Losing the request loses content with nothing behind it: wait out a
@@ -674,6 +720,109 @@ impl MsTeamsChannel {
         Duration::from_millis(ms.min(CONNECTOR_RETRY_MAX_DELAY_MS))
     }
 
+    /// Post `text` as ordered chunks, stopping at the first refusal.
+    ///
+    /// Teams rejects any single activity past ~100 KB (413
+    /// `MessageSizeTooBig`), so oversize content is split, preferring
+    /// paragraph, then line, then word boundaries; a long reply then lands in
+    /// full instead of failing outright, and the common in-budget case is a
+    /// single chunk, unchanged from a plain send.
+    ///
+    /// A refusal ends the send rather than skipping ahead, since the chunks
+    /// are ordered, and it is final: [`Self::activity_request`] retries only a
+    /// `429`, for the reason given there.
+    async fn post_in_chunks(
+        ctx: &SendContext,
+        url: &url::Url,
+        text: &str,
+        in_reply_to: Option<&str>,
+    ) -> ChunkedSend {
+        let chunks = split_message_for_teams(text);
+        for (index, chunk) in chunks.iter().enumerate() {
+            let mut body = serde_json::json!({ "type": "message", "text": chunk });
+            if let Some(reply_to_id) = in_reply_to {
+                body["replyToId"] = serde_json::Value::String(reply_to_id.to_string());
+            }
+            if let Err(error) = Self::activity_request(
+                ctx,
+                reqwest::Method::POST,
+                url.clone(),
+                &body,
+                ThrottlePolicy::Retry,
+            )
+            .await
+            {
+                return ChunkedSend::Failed {
+                    delivered: index,
+                    total: chunks.len(),
+                    error,
+                };
+            }
+            // Spacing goes between chunks, never after the last one: a
+            // single-chunk reply is the common case and must not pay for a
+            // split it did not need.
+            if index + 1 < chunks.len() {
+                tokio::time::sleep(TEAMS_CHUNK_SEND_SPACING).await;
+            }
+        }
+        ChunkedSend::Delivered
+    }
+
+    /// Deliver an answer too large to close a stream on, owning what the reader
+    /// is left with.
+    ///
+    /// This is the one delivery whose caller answers an error by sending the
+    /// whole response again. That is right while nothing has been delivered and
+    /// wrong once a chunk has, since the reader would then see that chunk
+    /// twice, and no retry here can repair it either: the failed chunk cannot
+    /// be reposted safely. So a failure with content already on screen is not
+    /// reported as one. The reader is told the reply is incomplete, the log
+    /// carries the failure, and the answer is not repeated.
+    async fn deliver_oversize_answer(ctx: &SendContext, url: &url::Url, text: &str) -> Result<()> {
+        match Self::post_in_chunks(ctx, url, text, None).await {
+            ChunkedSend::Delivered => Ok(()),
+            // Nothing reached the chat, so the caller's fallback is the reply's
+            // last chance and has to see the failure.
+            ChunkedSend::Failed {
+                delivered: 0,
+                error,
+                ..
+            } => Err(error),
+            ChunkedSend::Failed {
+                delivered,
+                total,
+                error,
+            } => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "delivered": delivered,
+                            "total": total,
+                            "error": format!("{error}"),
+                        })),
+                    "Teams reply delivered in part; the rest is dropped rather than resent"
+                );
+                // Best effort by nature: whatever refused the chunk may refuse
+                // this too, and the reader is no worse off than without it.
+                let body = serde_json::json!({
+                    "type": "message",
+                    "text": Self::truncated_notice(),
+                });
+                let _ = Self::activity_request(
+                    ctx,
+                    reqwest::Method::POST,
+                    url.clone(),
+                    &body,
+                    ThrottlePolicy::FailFast,
+                )
+                .await;
+                Ok(())
+            }
+        }
+    }
+
     /// Issue a Connector API request; returns the activity id from the
     /// response body when the Connector provides one.
     ///
@@ -865,14 +1014,14 @@ impl MsTeamsChannel {
         // A stream carries its answer in one activity and cannot chunk it, so
         // an oversize response has no way to close the bubble on its own
         // content: the final message is refused for the same size reason its
-        // frames were. Close it on what already streamed and deliver through
-        // `send`, which splits. Without this the request is spent only to
-        // fail, and the reply arrives by way of the caller's error fallback.
+        // frames were. Close it on what already streamed and deliver in split
+        // messages instead. Without this the request is spent only to fail,
+        // and the reply arrives by way of the caller's error fallback.
         if text.chars().count() > TEAMS_MAX_MESSAGE_CHARS {
             if let Some(stream) = stream.as_ref() {
                 let _ = Self::close_stream_activity(&ctx, stream, &Self::cancelled_notice()).await;
             }
-            return self.send(&SendMessage::new(&text, recipient)).await;
+            return Self::deliver_oversize_answer(&ctx, &url, &text).await;
         }
         let body = match stream.as_ref() {
             Some(stream) => {
@@ -1035,6 +1184,13 @@ impl MsTeamsChannel {
     /// rather than as an answer.
     fn cancelled_notice() -> String {
         zeroclaw_runtime::i18n::get_required_cli_string("channel-msteams-draft-cancelled")
+    }
+
+    /// Shown after the chunks that did land when the rest of a long reply
+    /// could not be delivered, so the answer does not simply stop mid-sentence
+    /// with nothing to explain it.
+    fn truncated_notice() -> String {
+        zeroclaw_runtime::i18n::get_required_cli_string("channel-msteams-reply-truncated")
     }
 
     /// Take an abandoned draft's bubble off the screen.
@@ -1427,8 +1583,7 @@ impl Channel for MsTeamsChannel {
         // Web also keep. The orchestrator strips envelopes from assistant text before
         // either a draft frame or a finalized reply, but nothing in the trait
         // obliges a caller to have run that pass, and this method also carries
-        // split chunks and the oversize-stream handoff. Stripping once here
-        // covers all of them.
+        // split chunks. Stripping once here covers all of them.
         let content = crate::util::strip_tool_call_tags(&message.content);
         // A paragraph that was nothing but an envelope has nothing left to
         // say. Teams rejects an empty activity, and the caller wanted that
@@ -1439,49 +1594,32 @@ impl Channel for MsTeamsChannel {
         let (_, ctx) = self.send_context(&message.recipient).await?;
         let conversation_id = Self::conversation_id_for_thread(&ctx, message.thread_ts.as_deref());
         let url = Self::activities_url(&ctx.reference, &conversation_id, None)?;
-        // Teams rejects any single activity past ~100 KB (413
-        // MessageSizeTooBig), so split oversize content into ordered chunks —
-        // a long response then lands in full instead of failing outright. The
-        // common (in-budget) case is a single chunk, unchanged from a plain send.
-        let chunks = split_message_for_teams(&content);
-        for (index, chunk) in chunks.iter().enumerate() {
-            let mut body = serde_json::json!({ "type": "message", "text": chunk });
-            if let Some(reply_to_id) = message.in_reply_to.as_deref() {
-                body["replyToId"] = serde_json::Value::String(reply_to_id.to_string());
-            }
-            Self::activity_request(
-                &ctx,
-                reqwest::Method::POST,
-                url.clone(),
-                &body,
-                ThrottlePolicy::Retry,
-            )
-            .await?;
-            // Spacing goes between chunks, never after the last one: a
-            // single-chunk reply is the common case and must not pay for a
-            // split it did not need.
-            if index + 1 < chunks.len() {
-                tokio::time::sleep(TEAMS_CHUNK_SEND_SPACING).await;
-            }
+        // Nothing behind this call covers a failure, so it is reported as one.
+        // Callers that reach here do not resend on error, which is what makes
+        // reporting a partial failure safe; the oversize finalization handoff,
+        // whose caller does resend, owns its outcome instead (see
+        // [`Self::deliver_oversize_answer`]).
+        match Self::post_in_chunks(&ctx, &url, &content, message.in_reply_to.as_deref()).await {
+            ChunkedSend::Delivered => Ok(()),
+            ChunkedSend::Failed { error, .. } => Err(error),
         }
-        Ok(())
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
-        let cfg = self.config().with_context(|| {
-            format!(
+        let Some(cfg) = self.config() else {
+            return Err(anyhow::Error::new(MsTeamsListenerFatalError::new(format!(
                 "Microsoft Teams channel '{}' has no [channels.msteams.{}] config block",
                 self.alias, self.alias
-            )
-        })?;
+            ))));
+        };
         if cfg.app_id.trim().is_empty() || cfg.tenant_id.trim().is_empty() {
-            anyhow::bail!(
-                "Microsoft Teams channel '{}' requires `app_id` and `tenant_id`: without \
-                 them inbound activities cannot be authenticated; set them under \
+            return Err(anyhow::Error::new(MsTeamsListenerFatalError::new(format!(
+                "Microsoft Teams channel '{}' requires `app_id` and `tenant_id`: `app_id` is \
+                 the audience inbound activities are authenticated against and `tenant_id` \
+                 names the Entra tenant outbound tokens come from; set them under \
                  [channels.msteams.{}]",
-                self.alias,
-                self.alias,
-            );
+                self.alias, self.alias,
+            ))));
         }
         // The secret is as load-bearing as the two ids above: Entra mints
         // every Connector token from it, so an enabled channel without one
@@ -1489,13 +1627,12 @@ impl Channel for MsTeamsChannel {
         // reply at the token exchange. Refusing at startup puts that in the
         // operator's log instead of one error per message.
         if cfg.app_password.trim().is_empty() {
-            anyhow::bail!(
+            return Err(anyhow::Error::new(MsTeamsListenerFatalError::new(format!(
                 "Microsoft Teams channel '{}' requires `app_password`: Entra mints the \
                  Connector token from it, so without it every reply fails; set it under \
                  [channels.msteams.{}]",
-                self.alias,
-                self.alias,
-            );
+                self.alias, self.alias,
+            ))));
         }
         // Said once here rather than on every draft callback, where
         // [`Self::stream_mode`] does the actual clamping.
@@ -2060,6 +2197,11 @@ mod tests {
             err.to_string()
                 .contains("requires `app_id` and `tenant_id`")
         );
+        assert!(
+            err.downcast_ref::<MsTeamsListenerFatalError>().is_some(),
+            "no retry resolves a missing id, so the supervisor has to be able to \
+             recognise this as fatal rather than restart on a backoff: {err}"
+        );
         assert!(!ch.health_check().await);
     }
 
@@ -2084,6 +2226,11 @@ mod tests {
         assert!(
             err.to_string().contains("requires `app_password`"),
             "unexpected error: {err}"
+        );
+        assert!(
+            err.downcast_ref::<MsTeamsListenerFatalError>().is_some(),
+            "no retry mints a secret, so the supervisor has to be able to recognise \
+             this as fatal rather than restart on a backoff: {err}"
         );
         assert!(
             !ch.health_check().await,
@@ -2762,6 +2909,98 @@ mod tests {
         assert_eq!(bodies[2]["entities"][0]["streamId"], "stream-1");
 
         assert!(ch.draft_streams.lock().is_empty());
+    }
+
+    /// An oversize answer cannot close a stream on its own content, so
+    /// finalization delivers it as ordered activities. A refusal partway
+    /// through has already put the earlier ones on screen, and the caller
+    /// answers an error by sending the whole answer again, which would repeat
+    /// what the reader can already see. So this delivery owns the outcome: the
+    /// reader is told the reply is incomplete and no error is reported. No
+    /// draft is registered here, so the only requests on the wire are the
+    /// chunks themselves.
+    #[tokio::test]
+    async fn an_oversize_finalization_that_fails_midway_tells_the_reader_not_the_caller() {
+        const MARKER: &str = "CHUNK-ONE-MARKER";
+
+        let connector = MockServer::start().await;
+        mock_token_endpoint(&connector).await;
+        // First chunk accepted, second refused. A 500 is not retried — only 429
+        // is, and only under `ThrottlePolicy::Retry` — so the request count is
+        // exactly one per chunk.
+        Mock::given(method("POST"))
+            .and(path("/teams/v3/conversations/a:1conv/activities"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+            .up_to_n_times(1)
+            .mount(&connector)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/teams/v3/conversations/a:1conv/activities"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&connector)
+            .await;
+
+        let ch = draft_channel(streaming_config(), &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
+
+        // Past the per-activity budget, and with no whitespace to split on the
+        // break falls where the budget runs out: exactly two chunks.
+        let oversize = format!("{MARKER}{}", "a".repeat(TEAMS_MAX_MESSAGE_CHARS + 2_000));
+        ch.finalize_draft("a:1conv", "no-such-draft", &oversize, false)
+            .await
+            .expect(
+                "a failure with content already posted must not be reported: the caller \
+                 answers an error by sending the whole answer again",
+            );
+
+        let bodies: Vec<String> = connector
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path().ends_with("/activities"))
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(
+            bodies.iter().filter(|b| b.contains(MARKER)).count(),
+            1,
+            "the chunk that was accepted must not be posted again"
+        );
+        // Compared against the notice itself rather than its English wording,
+        // which is a Fluent string and so depends on the resolved locale.
+        let notice = MsTeamsChannel::truncated_notice();
+        assert!(
+            bodies.last().is_some_and(|b| b.contains(&notice)),
+            "the reader is told the reply is incomplete rather than left with \
+             an answer that stops mid-sentence: {bodies:?}"
+        );
+    }
+
+    /// The other side of the same branch. Nothing was delivered, so the
+    /// caller's fallback is the answer's last chance and has to see the
+    /// failure; withholding it here would lose the reply outright.
+    #[tokio::test]
+    async fn an_oversize_finalization_that_delivers_nothing_reports_the_failure() {
+        let connector = MockServer::start().await;
+        mock_token_endpoint(&connector).await;
+        Mock::given(method("POST"))
+            .and(path("/teams/v3/conversations/a:1conv/activities"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&connector)
+            .await;
+
+        let ch = draft_channel(streaming_config(), &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
+
+        let oversize = "a".repeat(TEAMS_MAX_MESSAGE_CHARS + 2_000);
+        let err = ch
+            .finalize_draft("a:1conv", "no-such-draft", &oversize, false)
+            .await
+            .expect_err("the first chunk was refused, so nothing was delivered");
+        assert!(
+            format!("{err:#}").contains("500"),
+            "the transport failure must reach the caller: {err:#}"
+        );
     }
 
     /// What actually reached Teams, for a credential the model assembles

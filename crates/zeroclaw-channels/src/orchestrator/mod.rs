@@ -3929,11 +3929,20 @@ pub(crate) async fn run_draft_updater(
                 // Holding the pending tail also keeps frames monotonic, since
                 // the redacted value extends the text already shown instead of
                 // contradicting it, which is what Teams requires of a stream.
-                let publishable =
+                // Under the same switch as the replacement it exists to serve:
+                // withholding buys nothing once nothing will be redacted, and
+                // it would still cost the operator who turned the guardrail
+                // off a draft that trails a credential-shaped tail — one that,
+                // if the value never completes, no later frame releases and
+                // only the final reply resolves.
+                let publishable = if config.security.leak_detection.enabled {
                     match zeroclaw_runtime::security::incomplete_credential_tail(&accumulated) {
                         Some(offset) => &accumulated[..offset],
                         None => accumulated.as_str(),
-                    };
+                    }
+                } else {
+                    accumulated.as_str()
+                };
                 // Nothing to show yet rather than an empty bubble: the tail is
                 // all there is, and the next delta either completes it or ends
                 // it.
@@ -4843,6 +4852,22 @@ fn is_non_retryable_channel_listener_error(channel_name: &str, error: &anyhow::E
                 return true;
             }
             zeroclaw_providers::reliable::is_non_retryable(error)
+        }
+        // Exact match: the channel's `name()` is this constant regardless of
+        // alias, and the supervisor composes the alias into the component name
+        // rather than the channel name.
+        "msteams" => {
+            #[cfg(feature = "channel-msteams")]
+            if error
+                .downcast_ref::<crate::msteams::MsTeamsListenerFatalError>()
+                .is_some()
+            {
+                return true;
+            }
+            // Everything else the Teams listener can fail on — a port already
+            // in use, an unreachable Entra endpoint — is transient, so it
+            // stays on the retry path.
+            false
         }
         _ => false,
     }
@@ -7624,6 +7649,12 @@ async fn process_channel_message_body(
                             .await
                         {
                             Ok(()) => true,
+                            // Sending the whole answer again, which is safe
+                            // only because an error here means none of it
+                            // arrived. A channel that can fail with part of a
+                            // reply already posted owns that case itself
+                            // instead of reporting it, since this would repeat
+                            // what the recipient can already see.
                             Err(e) => {
                                 ::zeroclaw_log::record!(
                                     WARN,
@@ -33409,6 +33440,245 @@ Done."#;
             last.contains("file:///tmp/report.md?"),
             "redaction must leave the surrounding text intact: {last:?}"
         );
+    }
+
+    /// Uppercase keys, which is how an environment file spells them, and a
+    /// value of one repeated character, whose entropy is zero. The entropy
+    /// heuristic therefore cannot fire in either configuration, so the keyed
+    /// pattern is the only thing that can catch this — which is the point:
+    /// the withholding matches a key regardless of case, so a pattern that
+    /// does not would hold the value back and then publish it in the clear,
+    /// leaving the reader worse off than if nothing had been withheld. Both
+    /// halves of the policy are asserted, the draft frames and the final
+    /// reply, because the same miss reaches both.
+    #[tokio::test]
+    async fn draft_updater_redacts_uppercase_keyed_credentials() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        for high_entropy_tokens in [true, false] {
+            for (key, value) in [
+                ("API_KEY", "a".repeat(20)),
+                ("AWS_SECRET_ACCESS_KEY", "a".repeat(40)),
+            ] {
+                let label = format!("{key} with high_entropy_tokens={high_entropy_tokens}");
+                let mut config = Config::default();
+                config.security.leak_detection.high_entropy_tokens = high_entropy_tokens;
+                let config = Arc::new(config);
+
+                let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+                let channel: Arc<dyn Channel> = channel_impl.clone();
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                // Split inside the value, so no single delta carries a
+                // complete credential and the first frame is the one a late
+                // redaction would already have published.
+                for delta in [
+                    format!("Put {key}={}", &value[..6]),
+                    format!("{} in .env.", &value[6..]),
+                ] {
+                    tx.send(StreamDelta::Text(delta)).await.unwrap();
+                }
+                drop(tx);
+
+                run_draft_updater(
+                    channel,
+                    "chat-1".to_string(),
+                    "draft-1".to_string(),
+                    no_tools(),
+                    Arc::clone(&config),
+                    OutboundContentFormat::Markdown,
+                    rx,
+                )
+                .await;
+
+                let drafts = channel_impl.draft_updates.lock().await;
+                assert!(
+                    !drafts.is_empty(),
+                    "{label}: the transport must have been called"
+                );
+                let mut previous = String::new();
+                for (i, text) in drafts.iter().enumerate() {
+                    // Any value character published after the key is the
+                    // exposure, not just the whole value: the frame cannot be
+                    // retracted once read.
+                    assert!(
+                        !text.contains(&format!("{key}=a")),
+                        "{label}: frame {i} published the key and a raw value character: {text:?}"
+                    );
+                    assert!(
+                        text.starts_with(&previous),
+                        "{label}: frame {i} does not contain the frame before it: \
+                         {text:?} after {previous:?}"
+                    );
+                    previous.clone_from(text);
+                }
+                let last = drafts.last().unwrap();
+                assert!(
+                    last.contains("[REDACTED"),
+                    "{label}: the value must be redacted, not withheld forever: {last:?}"
+                );
+                assert!(
+                    last.contains("in .env."),
+                    "{label}: withholding must release the text after the value: {last:?}"
+                );
+
+                // The reported miss reached the final reply too, which runs
+                // the same policy on the whole answer.
+                let final_reply = redact_channel_outbound_leaks(
+                    &format!("Put {key}={value} in .env."),
+                    &config.security.leak_detection,
+                    OutboundContentFormat::Markdown,
+                );
+                assert!(
+                    !final_reply.contains(&format!("{key}=a")),
+                    "{label}: the final reply left the credential in place: {final_reply:?}"
+                );
+            }
+        }
+    }
+
+    /// The supervisor's contract for a deterministic configuration failure:
+    /// report it once and wait, rather than restart on a backoff every attempt
+    /// of which fails identically. The transient case shares the window, which
+    /// is what makes a single call in the fatal case evidence of parking
+    /// rather than of a window too short for a restart to land in.
+    #[cfg(feature = "channel-msteams")]
+    #[tokio::test]
+    async fn a_teams_configuration_failure_is_reported_once_instead_of_restarted() {
+        struct FailingListener {
+            calls: Arc<AtomicUsize>,
+            fatal: bool,
+        }
+
+        impl ::zeroclaw_api::attribution::Attributable for FailingListener {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Channel(
+                    ::zeroclaw_api::attribution::ChannelKind::MsTeams,
+                )
+            }
+            fn alias(&self) -> &str {
+                "default"
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Channel for FailingListener {
+            fn name(&self) -> &str {
+                "msteams"
+            }
+
+            async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.fatal {
+                    Err(anyhow::Error::new(
+                        crate::msteams::MsTeamsListenerFatalError::new(
+                            "Microsoft Teams channel 'default' requires `app_password`",
+                        ),
+                    ))
+                } else {
+                    Err(anyhow::Error::msg("port 3979 already in use"))
+                }
+            }
+        }
+
+        for fatal in [true, false] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let handle = spawn_supervised_listener_with_health_interval(
+                Arc::new(FailingListener {
+                    calls: Arc::clone(&calls),
+                    fatal,
+                }),
+                Some("default".to_string()),
+                tx,
+                1,
+                1,
+                Duration::from_secs(60),
+                cancel.clone(),
+            );
+
+            // One backoff plus a margin, so the retrying listener has come
+            // back by the time this reads the count.
+            tokio::time::sleep(Duration::from_millis(1_600)).await;
+            let observed = calls.load(Ordering::SeqCst);
+            cancel.cancel();
+            let _ = handle.await;
+
+            if fatal {
+                assert_eq!(
+                    observed, 1,
+                    "a missing credential fails the same way every time, so the listener \
+                     must be reported once and left waiting for a config change"
+                );
+            } else {
+                assert!(
+                    observed >= 2,
+                    "a port conflict can clear on its own, so it must stay on the retry \
+                     path; saw {observed} call(s)"
+                );
+            }
+        }
+    }
+
+    /// Both settings of the switch on one stream, because the cost of
+    /// withholding is only acceptable while it buys something. The value here
+    /// never reaches its threshold, so with the guardrail on the tail is held
+    /// for the rest of the stream and the final reply resolves it; with the
+    /// guardrail off the operator asked for the model's text, and a draft that
+    /// lags a tail nothing will ever redact is not that.
+    #[tokio::test]
+    async fn draft_updater_buffering_follows_the_leak_detection_switch() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        for enabled in [true, false] {
+            let mut config = Config::default();
+            config.security.leak_detection.enabled = enabled;
+            let config = Arc::new(config);
+
+            let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+            let channel: Arc<dyn Channel> = channel_impl.clone();
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            // Well under the 20 characters the `token` pattern needs, so the
+            // tail stays completable to the end of the stream.
+            for delta in ["Use token=", "abc123"] {
+                tx.send(StreamDelta::Text(delta.to_string())).await.unwrap();
+            }
+            drop(tx);
+
+            run_draft_updater(
+                channel,
+                "chat-1".to_string(),
+                "draft-1".to_string(),
+                no_tools(),
+                Arc::clone(&config),
+                OutboundContentFormat::Markdown,
+                rx,
+            )
+            .await;
+
+            let drafts = channel_impl.draft_updates.lock().await;
+            let last = drafts.last().unwrap_or_else(|| {
+                panic!("enabled={enabled}: the transport must have been called")
+            });
+            if enabled {
+                assert!(
+                    !last.contains("token=abc123"),
+                    "enabled: a still-completable tail must be withheld: {last:?}"
+                );
+            } else {
+                assert!(
+                    last.contains("token=abc123"),
+                    "disabled: the operator opted out, so nothing should be buffered: {last:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

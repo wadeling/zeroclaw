@@ -355,9 +355,14 @@ impl LeakDetector {
                         .expect("static Slack rotation token regex must compile"),
                     "Slack refresh/rotated token",
                 ),
-                // Generic
+                // Generic. Case-insensitive on the key, as the `password`,
+                // `secret` and `token` patterns are: `API_KEY=` is the
+                // conventional spelling in an environment file, and the
+                // streaming withholding in the channel layer matches keys
+                // without regard to case, so a case-sensitive pattern here
+                // would hold a value back and then publish it unredacted.
                 (
-                    Regex::new(r#"api[_-]?key[=:]\s*['"]*[a-zA-Z0-9_-]{20,}"#).unwrap(),
+                    Regex::new(r#"(?i)api[_-]?key[=:]\s*['"]*[a-zA-Z0-9_-]{20,}"#).unwrap(),
                     "Generic API key",
                 ),
             ]
@@ -392,8 +397,11 @@ impl LeakDetector {
                     "AWS Access Key ID",
                 ),
                 (
+                    // Case-insensitive on the key for the same reason as the
+                    // generic API key above; `AWS_SECRET_ACCESS_KEY` is the
+                    // spelling the AWS SDKs read from the environment.
                     Regex::new(
-                        r#"aws[_-]?secret[_-]?access[_-]?key[=:]\s*['"]*[a-zA-Z0-9/+=]{40}"#,
+                        r#"(?i)aws[_-]?secret[_-]?access[_-]?key[=:]\s*['"]*[a-zA-Z0-9/+=]{40}"#,
                     )
                     .unwrap(),
                     "AWS Secret Access Key",
@@ -980,34 +988,42 @@ mod tests {
         });
 
         for (parts, threshold) in CREDENTIAL_KEY_THRESHOLDS {
-            let key = parts.join("_");
-            // Values end on a character that starts none of these keys, so the
-            // trailing-prefix hold does not stand in for the threshold.
-            let short = format!("{key}={}9", "a".repeat(threshold - 2));
-            let complete = format!("{key}={}9", "a".repeat(threshold - 1));
+            let lower = parts.join("_");
+            // Both spellings, because the withholding matches a key without
+            // regard to case: a pattern that does not would hold the value
+            // back and then publish it unredacted, which is worse than never
+            // having withheld it. `API_KEY` and `AWS_SECRET_ACCESS_KEY` are
+            // also the conventional environment-variable spellings, so the
+            // uppercase form is the likelier one to arrive.
+            for key in [lower.clone(), lower.to_uppercase()] {
+                // Values end on a character that starts none of these keys, so
+                // the trailing-prefix hold does not stand in for the threshold.
+                let short = format!("{key}={}9", "a".repeat(threshold - 2));
+                let complete = format!("{key}={}9", "a".repeat(threshold - 1));
 
-            assert!(
-                matches!(detector.scan(&short), LeakResult::Clean),
-                "{key}: a value one short of {threshold} is below the detector, \
-                 so the tail must be withheld rather than published"
-            );
-            assert_eq!(
-                incomplete_credential_tail(&short),
-                Some(0),
-                "{key}: a value one short of {threshold} can still complete"
-            );
+                assert!(
+                    matches!(detector.scan(&short), LeakResult::Clean),
+                    "{key}: a value one short of {threshold} is below the detector, \
+                     so the tail must be withheld rather than published"
+                );
+                assert_eq!(
+                    incomplete_credential_tail(&short),
+                    Some(0),
+                    "{key}: a value one short of {threshold} can still complete"
+                );
 
-            assert!(
-                matches!(detector.scan(&complete), LeakResult::Detected { .. }),
-                "{key}: a value of {threshold} must be detected, or the \
-                 threshold here is larger than the pattern needs"
-            );
-            assert_eq!(
-                incomplete_credential_tail(&complete),
-                None,
-                "{key}: the detector redacts a complete value, so withholding \
-                 it would stall the surface"
-            );
+                assert!(
+                    matches!(detector.scan(&complete), LeakResult::Detected { .. }),
+                    "{key}: a value of {threshold} must be detected, or the \
+                     threshold here is larger than the pattern needs"
+                );
+                assert_eq!(
+                    incomplete_credential_tail(&complete),
+                    None,
+                    "{key}: the detector redacts a complete value, so withholding \
+                     it would stall the surface"
+                );
+            }
         }
     }
 

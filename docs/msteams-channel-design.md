@@ -373,7 +373,7 @@ crates/zeroclaw-channels/src/msteams/
 | Method | Behavior |
 | --- | --- |
 | `name()` | `"msteams"` |
-| `listen()` | axum server on `0.0.0.0:{port}`, route `POST {path}`. Refuses to start when `app_id`, `tenant_id`, or `app_password` is empty: the first two authenticate inbound activities, and Entra mints every Connector token from the secret, so a channel missing any of them would bind, report itself ready, and fail one reply at a time instead of once at startup |
+| `listen()` | axum server on `0.0.0.0:{port}`, route `POST {path}`. Refuses to start when `app_id`, `tenant_id`, or `app_password` is empty: `app_id` is the audience inbound tokens are validated against, while `tenant_id` and `app_password` are the endpoint and secret Entra mints every Connector token from, so a channel missing any of them would bind, report itself ready, and fail one reply at a time instead of once at startup. The refusal is a typed `MsTeamsListenerFatalError`, which the orchestrator's supervisor recognises as non-retryable: it records the failure once and parks the listener instead of restarting it on a backoff every attempt of which fails identically. Modelled on Discord's `DiscordListenerFatalError`, and deliberately narrow — a bind conflict or an unreachable Entra endpoint stays on the retry path |
 | `send()` | proactive Connector API POST |
 | `self_handle()` | bot id from `activity.recipient.id` (set on first inbound) — self-loop guard |
 | `self_addressed_mention()` | `<at>BotName</at>` form for the per-channel system prompt |
@@ -384,7 +384,7 @@ crates/zeroclaw-channels/src/msteams/
 | `send_draft()` | `partial` (1:1 only): register a lazy local draft handle; **no activity is POSTed** and the orchestrator's placeholder text is dropped, so the Teams stream opens on the first real update (mirrors OpenClaw's lazy `HttpStream`) and the gray bubble never flashes "...". Returns `None` in every other case, including a second concurrent turn in the same chat, which Teams cannot stream |
 | `update_draft_progress()` | informative update (`streamType: "informative"`) — the gray status text ("thinking…", tool status), clamped to the documented informative ceiling; opens the stream if it's the draft's first content |
 | `update_draft()` | content chunk (`streamType: "streaming"`, accumulated text); opens the stream if it's the draft's first content, and stops emitting frames once the accumulation passes the per-message size budget, where none of them could land |
-| `finalize_draft()` | carries no `replyToId` and no thread suffix, unlike the ordinary send the orchestrator falls back to on failure; the trait passes the draft handle rather than the originating message, and neither field would render anything, since a draft exists only in a personal chat and Teams' visual threading (and its `replyToId` handling) is channel-only. A team-channel turn never opens a draft, so its threaded reply goes out through `send()`, which does carry the anchor. Stream opened ⇒ final `message` activity (`streamType: "final"`), replacing the gray bubble and dropping the progress text; never opened (fast answer) ⇒ one plain message. An answer past the size budget cannot close a stream on its own content, so the stream is closed on what it already streamed, that message is deleted, and the answer goes out through `send()` as split messages. The draft's state is released on the way out even when nothing reached the wire (see §7) |
+| `finalize_draft()` | carries no `replyToId` and no thread suffix, unlike the ordinary send the orchestrator falls back to on failure; the trait passes the draft handle rather than the originating message, and neither field would render anything, since a draft exists only in a personal chat and Teams' visual threading (and its `replyToId` handling) is channel-only. A team-channel turn never opens a draft, so its threaded reply goes out through `send()`, which does carry the anchor. Stream opened ⇒ final `message` activity (`streamType: "final"`), replacing the gray bubble and dropping the progress text; never opened (fast answer) ⇒ one plain message. An answer past the size budget cannot close a stream on its own content, so the stream is closed on what it already streamed, that message is deleted, and the answer goes out through `send()` as split messages. That delivery owns its outcome, unlike every other path in this table, because the orchestrator answers a failed finalize by sending the whole answer again: right while nothing has landed, a duplicate once a chunk has. Nor can the failed chunk be retried, since the Connector takes no idempotency key and every post creates another message. So a failure with chunks already posted is not reported as one: the reader gets a short notice that the reply is incomplete (`channel-msteams-reply-truncated`), the log carries the delivered count, and the answer is not repeated. A failure with nothing delivered is still reported, since the caller's fallback is then the reply's last chance. The draft's state is released on the way out even when nothing reached the wire (see §7) |
 | `cancel_draft()` | best-effort takedown of the bubble, a `final` message closing the stream followed by a DELETE of the message that leaves (a DELETE alone is answered `2xx` and changes nothing on screen; see "Taking an abandoned bubble down"); nothing on the wire if the stream never opened. The state goes first and unconditionally, so a takedown nobody can perform still frees the chat for the turn that superseded this one |
 | `start_typing()` | one-shot `typing` activity (no `streaminfo` entity). Carries the visual feedback in group chats, where no draft bubble is available. Skipped in team channels, which have no indicator to show (see below) |
 | `stop_typing()` | no-op — Teams' typing indicator expires on its own |
@@ -648,7 +648,20 @@ this path still renders them until enough of the value arrives for the heuristic
 to fire. `incomplete_credential_tail` lives beside the detector's patterns
 because it depends on their thresholds, and
 `withhold_thresholds_match_the_detector_patterns` fails if a pattern's length
-requirement moves without this table following it.
+requirement moves without this table following it. That test also pins both
+spellings of every key, because the withholding compares keys without regard to
+case: a pattern that did not — the generic API key and AWS secret patterns
+originally did not — would hold a value back and then publish it in the clear,
+which leaves the reader worse off than no withholding at all. `API_KEY` and
+`AWS_SECRET_ACCESS_KEY` are also the conventional environment-variable
+spellings, so the uppercase form is the likelier one to arrive.
+
+Withholding runs under the same `security.leak_detection.enabled` switch as the
+replacement it exists to serve. With the guardrail off nothing will be redacted,
+so holding a credential-shaped tail buys nothing and costs the operator a draft
+that lags behind the model — and if the value never reaches its threshold, no
+later frame releases it and only the final reply resolves the text.
+`draft_updater_buffering_follows_the_leak_detection_switch` pins both settings.
 
 Teams still offers `off` and `partial` only. The paragraph-split path stays
 withdrawn as a matter of scope, not safety: reintroducing it is a

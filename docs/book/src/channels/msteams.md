@@ -141,10 +141,18 @@ Multiple aliases (`[channels.msteams.<alias>]`) each run their own listener
 and must use distinct ports.
 
 An enabled channel missing `app_id`, `tenant_id`, or `app_password` refuses to
-start and names the field in the daemon log. All three are load-bearing: the
-first two authenticate inbound activities, and Entra mints every outbound
-Connector token from the secret, so a channel without it would bind and report
-itself ready while every reply failed.
+start and names the field in the daemon log. All three are load-bearing, but on
+different paths: `app_id` is the audience every inbound activity's token is
+validated against, while `tenant_id` selects the Entra endpoint and
+`app_password` is the secret Entra mints outbound Connector tokens from. A
+channel missing either of the last two would still authenticate its callers,
+then bind and report itself ready while every reply failed.
+
+Because no retry supplies a missing credential, the supervisor reports such a
+failure once and leaves the channel down and unhealthy rather than restarting it
+on a backoff. Fix the configuration and restart the daemon. A failure that can
+clear on its own, such as a port already in use or an unreachable Entra
+endpoint, still retries.
 
 ## Inbound authentication
 
@@ -245,8 +253,11 @@ because the detector needs enough of the value to recognise it and the chunks
 before that point look clean. Text that could still become one of the
 credentials these patterns name is therefore held back rather than published,
 and released on the update that either completes the value, which is redacted,
-or rules it out. A credential no key announces, such as a bare high-entropy
-token, is still shown until enough of it arrives for the heuristic to fire.
+or rules it out. Holding back follows the same `security.leak_detection.enabled`
+switch as the replacement, so turning the guardrail off leaves the draft tracking
+the model rather than lagging a tail nothing will redact. A credential no key
+announces, such as a bare high-entropy token, is still shown until enough of it
+arrives for the heuristic to fire.
 
 Group chats show the ordinary typing indicator while the turn runs, at any
 setting. Team channels show no indicator at all, because Teams has none in a
@@ -270,6 +281,13 @@ single message. So in `partial` an answer that outgrows the budget stops
 updating the bubble, the bubble is removed, and the answer arrives as ordinary
 split messages. Status lines have their own, much smaller limit (1000
 characters) and are shortened with a trailing ellipsis if they exceed it.
+
+A split reply is delivered chunk by chunk, so a failure partway through leaves
+the earlier chunks in the chat. The rest is not resent, and the failed chunk is
+not retried: every post creates a new message, so either would risk showing the
+same text twice. Instead a short notice says the reply is incomplete, and the
+daemon log records how many chunks were delivered. A failure with nothing
+delivered is an ordinary send failure and the reply is retried in full.
 
 ## Proxying
 
