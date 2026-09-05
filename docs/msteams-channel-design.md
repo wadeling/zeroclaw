@@ -3,11 +3,10 @@
 - Status: implemented
 - Date: 2026-07-17 (revised after PR review)
 - Scope: plain-text send/receive, inbound JWT validation, @mention
-  gating, DM policy, sender allowlist, streaming draft updates (the gray
-  "thinking" message that resolves into the final reply), typing
-  indicators, and outbound chunking for Teams' per-message size limit.
-  `multi_message` is deliberately **not** offered; §"`multi_message` is not
-  offered" records why
+  gating, DM policy, sender allowlist, typing indicators, and outbound
+  chunking for Teams' per-message size limit. Progressive delivery — both
+  Teams' native streaming bubble and paragraph-per-message — is deliberately
+  **not** offered; §"Why the streaming protocol is not used" records why
 - Risk tier: High. The change-risk routing in
   [agent-guidelines](book/src/contributing/agent-guidelines.md#stability-and-risk)
   classifies trust-boundary and `.github/workflows/` changes as High, and
@@ -29,11 +28,10 @@
   - [Send and receive messages](https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-send-and-receive-messages?view=azure-bot-service-4.0):
     Connector activity POST and reply addressing
   - [Stream bot messages](https://learn.microsoft.com/en-us/microsoftteams/platform/bots/streaming-ux):
-    Teams native streaming, its 1:1-only limitation, and its 1 request/s
-    throttle. The two-minute cap on one streaming session appears only in the
-    error table, as `403 ContentStreamNotAllowed` / "Content stream finished
-    due to exceeded streaming time", described as "the strict time limit of
-    two minutes"
+    Teams native streaming — the protocol this channel does **not** use. Cited
+    for the constraints that rule it out: every frame carries the whole
+    response so far and may only extend the previous frame, plus a 1:1-only
+    limitation and a 1 request/s throttle
   - [Format your bot messages](https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/format-your-bot-messages):
     the per-activity size limit that drives outbound chunking
   - [Rate limiting for bots](https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/rate-limit):
@@ -88,7 +86,7 @@ and the condition that permits migration. For Teams those are:
 | Outbound auth | OAuth2 client-credentials against Entra, scope `https://api.botframework.com/.default`, token cached until expiry or until the credentials it was minted for change. |
 | Feature flag | `channel-msteams` in `zeroclaw-channels` |
 | DM policy | Configurable via `allow_dms` (default `true`). When `false`, inbound personal-chat messages are dropped. |
-| Streaming replies | Implemented via the existing draft pipeline (`send_draft`/`update_draft`/`finalize_draft`). `partial` uses Teams' native streaming protocol, which the platform allows in 1:1 chats only — group chats show a typing indicator and receive one final reply instead, and team channels receive the final reply with no indicator, since Teams has none in that scope. `multi_message` is refused and reads as `off`. (A message-edit fallback for groups was implemented and then rejected; see §3.) |
+| Progressive delivery | Not offered. One reply per turn, posted when the answer is complete; personal and group chats show a typing indicator while it runs. Teams' native streaming protocol requires each frame to carry the whole response so far and to only extend the last one, which cannot be reconciled with redacting a credential the model emits across several frames. §"Why the streaming protocol is not used" carries the argument. Paragraph-per-message delivery is out for a related reason — each paragraph is a permanent message drawn from text the outbound leak policy has not run over. |
 | Outbound size limit | Teams rejects a single activity past ~100 KB with `413` (`MessageSizeTooBig`), so `send()` splits oversize replies into ordered chunks at paragraph/line/word boundaries. |
 | Not supported | Media attachments, Adaptive Cards, SSO, polls, file consent, reactions, message delete |
 
@@ -226,23 +224,15 @@ paragraph break, then a line break, then a word boundary, and only hard-cuts
 when a single unbroken run overflows. The split is lossless — concatenating
 the chunks reproduces the input, so code and indentation survive — and an
 in-budget reply is sent unchanged as a single activity. Because the split
-lives in `send()`, every reply is covered, whichever `stream_mode` produced
-it.
+lives in `send()`, every reply is covered.
 
-The ceiling is not lifted for streaming: the streaming spec's error table
-carries `403 ContentStreamNotAllowed` ("Message size too large") and points
-at the same size document. A stream cannot be chunked, since every frame
-must contain what was streamed before it and a stream closes with exactly
-one final activity, so `partial` handles an oversize answer by leaving the
-stream rather than by splitting inside it. Frames stop going out once the
-accumulation passes the budget, because past that point none of them can
-land; finalize then takes the opened bubble down and delivers the answer
-through `send()`, which splits. Giving up on the stream is recorded once per
-draft (`DEBUG`), not on every delta that follows it into the same branch. An
-answer already past the budget on its first update never opens a stream at
-all, so no bubble appears and there is none to take down. The reply would arrive either way (the
-orchestrator resends through `send()` when finalize fails), but only by way
-of an error path, at the cost of requests spent to be refused.
+A chunk is a message of its own, so a failure partway through leaves the
+earlier chunks in the chat and the rest undelivered. The failed chunk is not
+reposted past its throttle budget: creating an activity is not idempotent and
+the Connector offers no idempotency key, so a retry after an ambiguous failure
+risks showing the same text twice. The error propagates and the orchestrator
+records it, which matches how every other splitting channel in the repo
+behaves.
 
 Splitting here rather than asking the model to shorten its answer is
 deliberate: the ceiling is a hard, deterministic transport constraint counted
@@ -252,13 +242,11 @@ the repo (Discord 2 000, Telegram 4 096, Slack 40 000, Lark card ~28 KB).
 
 #### Outbound rate limits
 
-Teams applies two separate quotas, and the two delivery paths are governed by
-different ones:
+Teams applies several quotas to a bot's outbound sends:
 
 | Quota | Limit | Applies to |
 | --- | --- | --- |
-| Per bot per conversation, "send to conversation" | 7/1s, 8/2s, 60/30s, 1800/1h | `send()`, each split chunk, typing (group chats only) |
-| Streaming API | 1 request/s, and a 2-minute cap per stream | `partial` draft updates |
+| Per bot per conversation, "send to conversation" | 7/1s, 8/2s, 60/30s, 1800/1h | `send()`, each split chunk, the typing indicator |
 | Per conversation, all bots | 14/1s, 16/2s | shared with other apps in the conversation |
 | Per app per tenant | 50 RPS | everything |
 
@@ -271,24 +259,15 @@ rather than self-enforced, since honoring 1800/hour as a rate would cost a
 ten-chunk reply twenty seconds of delivery for a bound no realistic
 conversation reaches.
 
-Each path is paced by the mechanism its quota allows, and the two are not
-interchangeable:
-
-- `partial` skips: `draft_update_interval_ms` (default 1500) drops an update
-  that arrives early. Skipping is free because every update carries the whole
-  response so far, and blocking is not an option, since the caller is the
-  agent's token loop. The documented streaming cap is 1/s; the default keeps
-  the same headroom over it that Microsoft's own Teams AI SDK takes, which
-  buffers to 1.5 s rather than sitting on the limit.
-- Split chunks wait: a chunk is a distinct message, so it cannot be skipped
-  without losing it. `TEAMS_CHUNK_SEND_SPACING` (500 ms) separates the chunks
-  of one oversize reply instead. Without it a long enough reply trips a window
-  on its own, which Microsoft's own guidance calls out ("message splitting at
-  the service level results in higher than expected RPS"). The value is the
-  tightest reachable window's spacing (250 ms, from 8/2s) doubled for headroom,
-  which leaves the 1s and 2s windows at 2/7 and 4/8 so a concurrent turn in the
-  same conversation still fits. The spacing goes between chunks only, so the
-  common single-activity reply waits not at all.
+A chunk is a distinct message, so it cannot be skipped without losing it.
+`TEAMS_CHUNK_SEND_SPACING` (500 ms) separates the chunks of one oversize reply.
+Without it a long enough reply trips a window on its own, which Microsoft's own
+guidance calls out ("message splitting at the service level results in higher
+than expected RPS"). The value is the tightest reachable window's spacing
+(250 ms, from 8/2s) doubled for headroom, which leaves the 1s and 2s windows at
+2/7 and 4/8 so a concurrent turn in the same conversation still fits. The
+spacing goes between chunks only, so the common single-activity reply waits not
+at all.
 
 On `429`, `activity_request` retries up to `CONNECTOR_MAX_ATTEMPTS` (3),
 honoring `Retry-After` when Teams sends one and otherwise doubling from 1 s
@@ -298,8 +277,8 @@ less than 2.25 s even at the bottom of both jitter bands, so a filled 1s or 2s
 window, the two a single reply's burst can fill, has certainly reopened. The
 30s and hourly windows are not waited out, because they fill only when the
 conversation is genuinely over budget and reporting that beats holding a turn
-for half a minute. Every retrying request turns out to be a send outside a
-stream, so one deadline covers them all: the per-turn budget
+for half a minute. Every retrying request delivers a reply or one of its
+chunks, so one deadline covers them all: the per-turn budget
 (`channels.message_timeout_secs`, 300 s by default), which a 10 s ceiling on
 one wait sits well inside. Microsoft's own sample retries three times from a
 2 s base capped at 20 s; this is tighter on purpose, for that deadline.
@@ -313,35 +292,19 @@ request loses content *and nothing behind it would resend*:
 | Request | Policy |
 | --- | --- |
 | `send()` and its chunks | `Retry` |
-| The finalize activity | `FailFast` |
-| Intermediate streaming frames (`informative`, `streaming`) | `FailFast` |
 | Typing indicator | `FailFast` |
-| Bubble takedown (closing `final` + `DELETE`) | `FailFast` |
 
-The frames, the typing indicator and the cancel are superseded by whatever
-comes next, and their callers already treat an error as "skip". Retrying them
-would stall the agent's token loop for seconds to redeliver a frame nobody will
-see, which is the very cost `draft_update_interval_ms` skips updates to avoid.
-
-The finalize activity looks like it belongs in the other row and does not,
-because the orchestrator answers a failed finalize by resending the whole
-answer through `send()`, whose chunks retry: the content is covered one layer
-up, so waiting here only delays that fallback. The case where waiting is most
-tempting is exactly the case where it is most futile. A stream past its
-two-minute deadline cannot accept the message however many times it is offered,
-and Teams reports that state as a `429` ("API calls quota exceeded") as readily
-as a `403`, so a retrying finalize spends its whole budget on a session that is
-already gone. Observed live: a 150 s tool call left three attempts over five
-seconds to fail against a stream Teams had closed at the two-minute mark, all
-of it ahead of a fallback that then delivered normally.
+The typing indicator is superseded by the reply itself and its caller already
+treats an error as "skip", so retrying it would only stall the turn it is meant
+to announce. A reply is the opposite: nothing follows it to carry the answer
+again, so it waits the throttle out.
 
 `502`/`504` are deliberately *not* retried even though Microsoft's guidance
 lists them alongside `429`: creating an activity is not idempotent and the
 Connector exposes no idempotency key, so retrying an ambiguous gateway failure
 risks posting a user-visible message twice. One reported failure is the better
 outcome. Note also that the generic `PacedChannel` wrapper
-(`reply_min_interval_secs`) does not cover any of this: it is off by default
-and deliberately does not pace draft paths.
+(`reply_min_interval_secs`) does not cover any of this: it is off by default.
 
 ### Conversation ID semantics (learned from OpenClaw `inbound.ts`)
 
@@ -379,304 +342,66 @@ crates/zeroclaw-channels/src/msteams/
 | `self_addressed_mention()` | `<at>BotName</at>` form for the per-channel system prompt |
 | `is_direct_message()` | `conversationType == "personal"` |
 | `health_check()` | true once listener is bound |
-| `supports_draft_updates()` | `true` when the effective `stream_mode` is `partial` |
-| `supports_draft_updates_for()` | per-message refinement of the above: `partial` ⇒ personal (1:1) chats only, because Teams' native streaming is 1:1-only (group chats get a typing indicator plus one final reply, team channels get the reply alone, and Teams would otherwise notify on the placeholder rather than the answer); `off` ⇒ false |
-| `send_draft()` | `partial` (1:1 only): register a lazy local draft handle; **no activity is POSTed** and the orchestrator's placeholder text is dropped, so the Teams stream opens on the first real update (mirrors OpenClaw's lazy `HttpStream`) and the gray bubble never flashes "...". Returns `None` in every other case, including a second concurrent turn in the same chat, which Teams cannot stream |
-| `update_draft_progress()` | informative update (`streamType: "informative"`) — the gray status text ("thinking…", tool status), clamped to the documented informative ceiling; opens the stream if it's the draft's first content |
-| `update_draft()` | content chunk (`streamType: "streaming"`, accumulated text); opens the stream if it's the draft's first content, and stops emitting frames once the accumulation passes the per-message size budget, where none of them could land |
-| `finalize_draft()` | carries no `replyToId` and no thread suffix, unlike the ordinary send the orchestrator falls back to on failure; the trait passes the draft handle rather than the originating message, and neither field would render anything, since a draft exists only in a personal chat and Teams' visual threading (and its `replyToId` handling) is channel-only. A team-channel turn never opens a draft, so its threaded reply goes out through `send()`, which does carry the anchor. Stream opened ⇒ final `message` activity (`streamType: "final"`), replacing the gray bubble and dropping the progress text; never opened (fast answer) ⇒ one plain message. An answer past the size budget cannot close a stream on its own content, so the stream is closed on what it already streamed, that message is deleted, and the answer goes out through `send()` as split messages. That delivery owns its outcome, unlike every other path in this table, because the orchestrator answers a failed finalize by sending the whole answer again: right while nothing has landed, a duplicate once a chunk has. Nor can the failed chunk be retried, since the Connector takes no idempotency key and every post creates another message. So a failure with chunks already posted is not reported as one: the reader gets a short notice that the reply is incomplete (`channel-msteams-reply-truncated`), the log carries the delivered count, and the answer is not repeated. A failure with nothing delivered is still reported, since the caller's fallback is then the reply's last chance. The draft's state is released on the way out even when nothing reached the wire (see §7) |
-| `cancel_draft()` | best-effort takedown of the bubble, a `final` message closing the stream followed by a DELETE of the message that leaves (a DELETE alone is answered `2xx` and changes nothing on screen; see "Taking an abandoned bubble down"); nothing on the wire if the stream never opened. The state goes first and unconditionally, so a takedown nobody can perform still frees the chat for the turn that superseded this one |
-| `start_typing()` | one-shot `typing` activity (no `streaminfo` entity). Carries the visual feedback in group chats, where no draft bubble is available. Skipped in team channels, which have no indicator to show (see below) |
+| `start_typing()` | one-shot `typing` activity (no `streaminfo` entity). Carries the visual feedback for the whole turn in personal and group chats. Skipped in team channels, which have no indicator to show (see below) |
 | `stop_typing()` | no-op — Teams' typing indicator expires on its own |
-| `update_draft_lifecycle()` | **deliberately not implemented**, so the trait default drops the event. Lifecycle chrome and tool status compete for one informative slot per interval, and Teams discards every informative frame once content starts: rendering both would spend that slot on typed chrome and leave the tool status — the line that says which tool is running — for the following interval or for after the cut-off. Slack and Telegram override it because their edit budget is not this tight. Teams still shows a status line, from `Status` deltas through `update_draft_progress()`, so the gray bubble is not silent. Implementing it would need its own Fluent keys and belongs with that work, not here |
-| `update_draft_progress_batch()` | trait default, which is the loop this channel would otherwise write: `update_draft_progress()` answers from memory unless the interval has elapsed and content has not started, so an upstream burst costs one POST at most, not one per item. It differs from coalescing in which item survives — the first of the burst is published and the rest are dropped, where a coalescing override would publish the newest — so a burst can leave a status line one interval stale |
 | everything else | trait defaults (deferred) |
 
-`stream_mode` is live config, so an operator editing it mid-turn flips it under
-an open draft. Only `send_draft` reads it: one delivery lifecycle owns every
-draft, so the callbacks after it need not ask which one a handle belongs to, and
-a reload cannot hand a draft to an implementation that never created its state.
-The values those callbacks do read are the ones meant to be live: credentials
-and `draft_update_interval_ms` are resolved from current config on every call.
+### Why the streaming protocol is not used
 
-### Streaming protocol detail (the gray "thinking" message)
+Teams has a native **streaming messages** feature — the gray "thinking" bubble
+Copilot shows, which OpenClaw drives through the Teams SDK's `ctx.stream`
+(`reply-stream-controller.ts`). This channel does not use it. Each turn posts
+one reply when the answer is complete.
 
-This is Teams' native **streaming messages** feature — the same thing
-OpenClaw drives through the Teams SDK's `ctx.stream`
-(`reply-stream-controller.ts`). Wire format (Bot Framework REST, no SDK
-needed):
+The protocol's own rules are what rule it out. Every frame carries the whole
+response so far, not a delta, and each frame may only extend what the previous
+one published; Teams refuses a frame that retracts rendered text, and the
+closing message replaces what is on screen rather than what a reader has
+already seen. So a frame is irrevocable in the only sense that matters here.
 
-1. Informative/status update: POST a `typing` activity with an
-   `entities` entry `{ "type": "streaminfo", "streamType":
-   "informative", "streamSequence": n }` and `text` = status line. The
-   first activity's returned id becomes the `streamId`; subsequent
-   activities include `"streamId"` in the entity.
-2. Content chunks: `typing` activity with `"streamType": "streaming"`,
-   `text` = accumulated (not delta) response text.
-3. Final: a `message` activity with `"streamType": "final"` and the full
-   text. Teams replaces the gray streaming bubble with a normal message;
-   informative/status history is no longer shown.
+That collides with the outbound leak policy in `security.leak_detection`, which
+every other outbound path runs before anything reaches a channel. A detector
+needs enough of a value to recognise it, so the frames that assemble a
+credential all arrive before any of them looks like one. Publishing the
+accumulation as it stands renders the prefix; redacting once the value
+completes would retract text already shown, which Teams rejects and a reader
+has already read either way.
 
-Platform constraints, and how we handle them:
+Withholding the pending tail closes the gap for a bounded pattern. A keyed
+form (`api_key = …`) has a known start and a length ceiling, so the text that
+could still become one is identifiable, and it is released on the frame that
+either completes the value — redacted, in the same position — or rules it out.
+Frames stay monotonic and nothing leaks.
 
-- Native streaming is only supported in **one-on-one chats**. Group
-  chats and team channels don't open drafts at all and receive one final
-  reply; a group chat shows the ordinary typing indicator meanwhile, a
-  team channel shows nothing. (A message-edit fallback was tried first;
-  Teams notifies on the initial placeholder and stays silent on the edit
-  that carries the real answer, which is exactly backwards.)
-- Teams allows **one streaming response per chat at a time**. A turn cannot
-  see its neighbours, and with `interrupt_on_new_message` off (the default)
-  the orchestrator neither cancels nor awaits the previous in-flight task for
-  a sender, so a follow-up arriving during a slow turn runs alongside it. Both
-  would open a stream in the same chat, and the second one's frames would all
-  be spent on a stream Teams refuses to start. `send_draft` therefore hands
-  the second turn no draft: its answer is delivered as one ordinary message,
-  the same shape a group chat already gets. Declining is a handle the channel
-  does not return, not a capability it withdraws, so the orchestrator keys the
-  rest of the turn on that handle: no delta sink is handed to the runtime, and
-  the typing indicator and tool notifications a draft would have replaced stay
-  on. Keyed on the capability instead, such a turn would run with a sink whose
-  updater was never spawned, and would show nothing at all until its answer
-  landed. Any channel reaches this state when `send_draft` fails transiently,
-  so the correction is not Teams-specific. The draft records its conversation
-  for this check, and ages out two minutes after its stream started so a
-  draft that some path failed to finalize or cancel cannot cost the chat its
-  streaming for the life of the process. The clock runs from the stream's own
-  start rather than from registration, because a stream opens lazily — often
-  a whole tool loop later — and the two instants are far enough apart to
-  matter: `message_timeout_secs` defaults to `300`, so a turn may still be
-  streaming when its draft turns two minutes old. Ageing from registration
-  would drop that entry mid-answer, and with it the only `streamId` the
-  process holds, leaving a bubble no finalize or cancel could take down.
-  A draft that never opened a stream ages from registration, since removing
-  it strands nothing on screen.
-- Updates are rate-limited (~1/s). `draft_update_interval_ms` defaults
-  to `1500`, the same headroom Microsoft's own SDK buffers to; the
-  orchestrator already throttles draft flushes on this interval, so no
-  extra limiter is needed.
-- `streamSequence` must be monotonically increasing; kept per-draft in
-  the in-memory draft state alongside the `streamId`.
-- Streamed content must grow monotonically: every `streaming` frame and
-  the `final` message has to contain what was streamed before it, so
-  `A brown` may be followed by `A brown fox` but not by `Hello`.
-  Violations are rejected with `403 ContentStreamNotAllowed` ("Request
-  streamed content should contain the previously streamed content").
-  A tool loop breaks this routinely rather than rarely: text the model
-  emits before a tool call is streamed, and the answer it composes after
-  the tool returns is frequently not a continuation of it. We do not try
-  to predict the rejection, because what is streamed and what is
-  finalized pass through different sanitizers and a false positive would
-  discard a perfectly good bubble. Instead the rejection is handled: the
-  orchestrator's existing fallback resends the answer as an ordinary
-  message, and finalize takes the abandoned stream down first (see
-  "Taking an abandoned bubble down" below), since Teams keeps rendering an
-  opened stream until its final message arrives and the reply would
-  otherwise land underneath a draft frozen on the last frame that got
-  through. OpenClaw hit the same protocol edge and responded by disabling
-  streaming outright (openclaw/openclaw#56040); keeping the fallback costs
-  two requests and preserves the bubble for the answers that do stream
-  cleanly.
-- Informative updates stop rendering once content streaming begins and
-  are discarded from then on, so the channel stops sending them after
-  the first `streaming` frame instead of spending the stream's
-  one-per-second budget on frames the client throws away.
-- An informative frame must not exceed "1 kb or 1000 characters". The
-  document does not say how the byte figure is measured, so status lines
-  are clamped against both bounds, whichever binds first, and a shortened
-  line is marked with an ellipsis. ASCII trips the character count; other
-  scripts trip the byte count first.
-- A stream is held to the same per-message size ceiling as an ordinary
-  reply, reported as `403 ContentStreamNotAllowed` ("Message size too
-  large") rather than the `413` a plain send gets. See the size section
-  below for how `partial` gets an oversize answer delivered.
-- A streaming session must finish inside **two minutes**, documented as a
-  strict limit on completing the streaming process rather than as an idle
-  timeout. Teams closes an unfinished session, labels the bubble "this
-  response was stopped", and refuses every later activity on that
-  `streamId`. Any turn whose tools run longer than two minutes ends up
-  here, which for an agent is ordinary rather than exceptional, so the path
-  is treated as expected: the finalize is rejected, the bubble is taken
-  down, and the fallback delivers the answer as an ordinary message. The
-  rejection arrives as either `403 ContentStreamNotAllowed` ("Content
-  stream finished due to exceeded streaming time") or `429` ("API calls
-  quota exceeded"); both have been observed live for the same expired
-  session, so neither is treated as retryable. Whether heartbeat frames
-  could hold a session open past two minutes is untested here: the runs
-  that hit the limit were silent for their whole tool call, so they cannot
-  tell a total-time limit from an idle one. Microsoft's wording says total,
-  and nothing in the current design depends on the answer.
+It does not close the gap for an unbounded pattern. A database connection URL
+can span arbitrary text and newlines; a PEM block runs from its `BEGIN` marker
+to an `END` marker that may never arrive. For these, "not yet decidable" and
+"never going to complete" are the same observation, so the choice is between
+publishing a prefix that may turn out to be a credential and stalling the
+bubble until the turn ends. Neither is a streaming implementation worth
+shipping, and picking one per pattern family means a partial-match state
+machine for each — a security boundary of its own, not a detail of adding a
+channel.
 
-### Taking an abandoned bubble down
+A completed answer has none of this structure: the whole text is decidable, so
+it is redacted once and posted once. That is what this channel does. The
+streaming protocol stays unimplemented until the boundary problem has an
+answer of its own, and this design records the reason so a later attempt starts
+from it rather than rediscovering it.
 
-Three paths abandon an opened stream: a finalize Teams refuses, an answer
-too large for a stream to close on, and `cancel_draft` when
-`interrupt_on_new_message` supersedes a turn. All three have to get the
-bubble off the screen, and a `DELETE` on the streaming activity does not
-do it.
+Two consequences are worth stating plainly, since streaming is what would
+otherwise cover them:
 
-Teams accepts that delete and answers `2xx`, so it reads as success in
-every log, but it only drops the activity on the service. The client keeps
-rendering the bubble. Live, one stayed up for more than five minutes past
-a successful delete, outliving the two-minute session limit, and its Stop
-button reported "can't stop the response" because the stream it would have
-stopped was already gone. This is consistent with the protocol as
-documented: the streaming contract ends a stream through the final message,
-the user's Stop button, or the two-minute limit, and lists no delete.
-
-So a takedown closes the stream first, with a `final` message, and then
-deletes the ordinary message that leaves behind. Because a final message
-must contain everything already streamed, it closes on the draft's last
-content frame, which is the one text Teams cannot refuse for that reason.
-A draft that only ever showed status lines has no such content (informative
-frames are not part of the content stream), so it closes on the
-`channel-msteams-draft-cancelled` notice instead. Both requests are
-`FailFast`: the caller has already decided what the conversation gets
-instead, and waiting out a throttle would only delay it.
-
-The notice is written to be read, because it is what stays on screen if the
-delete does not land. That degradation is the reason the closing text is a
-localized string rather than a placeholder.
-
-A fourth case cannot take the bubble down at all: the takedown needs a
-Connector context, and the failure may be the resolution of that context, when
-live config no longer carries the channel's block, the conversation reference
-is gone, or Entra will not mint a token. Both `finalize_draft` and
-`cancel_draft` then drop the draft's local state anyway and log a `WARN`
-naming the stream, since a bubble left up looks exactly like one that was taken
-down. Nothing is retried: the one context that could close the stream is the
-one that could not be resolved, and finalize's caller is already resending the
-answer as an ordinary message, which a retry here would only delay.
-
-Closing on the streamed content publishes draft-boundary text as a `message`
-activity, which is the shape the next section refuses for `multi_message`, and
-the difference is the reason this one is allowed. There, a paragraph is a
-permanent message no later reply can edit or recall, published for every
-answer. Here the message exists to be withdrawn: the `DELETE` that follows it
-is the point of the pair, the text has already been on the same screen in the
-bubble it is closing, and the path runs only when a turn is abandoned. What
-remains is the case where the delete does not land, which is why that failure
-is a `WARN` naming the stream rather than a silent one. The closing text is
-also deliberately not re-sanitized here: a final message is accepted because it
-contains what was streamed, so altering it would forfeit the one property that
-makes this takedown reliable.
-
-Finalize clears the draft's state before its closing request rather than after,
-so the chat's stream slot is free while that request is in flight. A concurrent
-turn arriving inside that window opens a draft whose stream Teams may still
-refuse, since the first stream has not closed yet. The window is one request
-wide and the cost is that turn streaming nothing; holding the slot until the
-request returned would instead risk keeping it forever whenever the request
-failed, which is the outcome the ordering is chosen against.
-
-The reverse interleaving has its own window. An opening activity's `streamId`
-does not exist until Teams returns it, so a finalize, cancel or sweep landing
-while that request is outstanding reads `stream_id` as `None` and correctly
-concludes there is nothing to take down. The id then comes back to a draft that
-is gone. `push_stream_activity` closes that stream itself, because the value it
-holds at that moment is the only reference to it anywhere in the process: a
-bubble left there could not be closed by any later call, and Teams would render
-it, Stop button included, until the session limit expired. The cleanup does not
-depend on which path cleared the entry, and it deliberately does not reinstate
-the entry — the draft was abandoned, and the chat's stream slot belongs to
-whatever replaced it. For the same reason that frame records no pacing
-timestamp: an interval floor outlives the draft it was set for, and a successor
-turn would otherwise inherit a floor it never set.
-
-### `multi_message` is not offered
-
-`stream_mode = "multi_message"` splits an answer into one message per
-paragraph, the way Discord and Matrix do. Teams refuses the value instead:
-`stream_mode()` resolves it to `off`, and `listen()` names the fallback once in
-the operator's log. The channel therefore offers `off` and `partial` only.
-
-A paragraph-split implementation existed in this branch and was withdrawn on
-review. What it published came from the draft boundary, which at the time the
-orchestrator sanitized with `sanitize_streaming_draft_text` alone: that pass
-removes reasoning and tool-protocol envelopes, but not the configured
-credential redaction (`redact_channel_outbound_leaks`) that the delivery path
-adds. Under `partial` the exposure was transient, since the sanitized final
-message replaces the bubble's text; a paragraph is a permanent message that no
-later reply can edit or recall, so a credential in mid-answer text would have
-stayed in the conversation. Reviewer finding on
-[#9241](https://github.com/zeroclaw-labs/zeroclaw/pull/9241#issuecomment-5332586063).
-
-That gap is now closed at the shared boundary rather than per channel, so the
-policy stays in one place. `run_draft_updater` applies
-`redact_channel_outbound_leaks` under the same `security.leak_detection` policy
-and the same outbound format the final sanitizer resolves, on every frame before
-it reaches the transport. This matters most for a credential the model emits
-across several deltas, which no single delta looks like and which the final
-sanitizer cannot help with, because by the time it runs the frame has already
-been displayed. Every channel that renders a draft benefits. Matrix's
-single-message updater is a separate path and still carries the gap.
-
-Drafts and final delivery are now held to the same redaction policy, though not
-to an identical pipeline: drafts keep the streaming-aware sanitizer, which holds
-back protocol prefixes that a later delta may complete.
-
-Redacting each frame is not sufficient on its own, because a detector needs
-enough of a value to recognise it. `token=` followed by ten characters is below
-the twenty the pattern requires, so the frame carrying it is clean by the
-detector's own reckoning and goes out raw; the frame after it, once the value is
-complete, carries `[REDACTED_SECRET]` instead. Two consequences follow. The
-reader has already seen ten characters of the credential, and no later edit
-retracts that. And the redacted frame no longer contains the text of the frame
-before it, so Teams rejects it — the handled rejection above, but spent on a
-frame that had no reason to fail.
-
-`run_draft_updater` therefore publishes only text that a later delta cannot turn
-into a credential, asking `incomplete_credential_tail` where the pending region
-begins and holding from there. The withheld text is not lost: the next frame
-publishes it once the value either completes, in which case the detector's
-replacement covers it, or becomes something a pattern can no longer match. This
-keeps frames monotonic by construction, since the replacement extends the text
-already shown rather than contradicting it.
-
-The keys are matched while they are still arriving, not only once complete. A
-provider breaks deltas wherever it likes, so `token` reaches the boundary as
-`to` and then `ken=`; withholding from a finished key alone would publish `to`
-and retract it one frame later, which is the same protocol violation by another
-route. The cost is that text ending on a prefix of one of these keys waits for
-the delta that decides the word, bounded by the longest key and released as soon
-as the word cannot be one.
-
-The residual boundary is a credential no key announces — a bare high-entropy
-token, a JWT. Withholding every long unbroken run would hold back ordinary text
-such as a URL or a hash, and those detectors are heuristic rather than keyed, so
-this path still renders them until enough of the value arrives for the heuristic
-to fire. `incomplete_credential_tail` lives beside the detector's patterns
-because it depends on their thresholds, and
-`withhold_thresholds_match_the_detector_patterns` fails if a pattern's length
-requirement moves without this table following it. That test also pins both
-spellings of every key, because the withholding compares keys without regard to
-case: a pattern that did not — the generic API key and AWS secret patterns
-originally did not — would hold a value back and then publish it in the clear,
-which leaves the reader worse off than no withholding at all. `API_KEY` and
-`AWS_SECRET_ACCESS_KEY` are also the conventional environment-variable
-spellings, so the uppercase form is the likelier one to arrive.
-
-Withholding runs under the same `security.leak_detection.enabled` switch as the
-replacement it exists to serve. With the guardrail off nothing will be redacted,
-so holding a credential-shaped tail buys nothing and costs the operator a draft
-that lags behind the model — and if the value never reaches its threshold, no
-later frame releases it and only the final reply resolves the text.
-`draft_updater_buffering_follows_the_leak_detection_switch` pins both settings.
-
-Teams still offers `off` and `partial` only. The paragraph-split path stays
-withdrawn as a matter of scope, not safety: reintroducing it is a
-delivery-behavior change that deserves its own review rather than arriving as a
-side effect of the redaction fix.
-
-The withdrawal costs Teams nothing that `partial` already provides in a
-personal chat, and removes the only way to show progress inside a team channel,
-where Teams has no typing indicator either. A long channel turn is therefore
-silent until its reply arrives.
+- A personal chat shows a typing indicator rather than accumulating text, so a
+  slow turn gives no sense of progress beyond "working".
+- A team channel shows nothing at all, because Teams has no typing indicator
+  there either (see below), so a long channel turn is silent until its reply
+  arrives.
 
 #### Typing indicator scope
 
-Group chats show the ordinary typing indicator while a turn runs, regardless of
-`stream_mode`. Team channels are skipped: Teams draws no typing indicator in a
+Personal and group chats show the ordinary typing indicator while a turn runs.
+Team channels are skipped: Teams draws no typing indicator in a
 channel for anyone, bot or human, which Microsoft's documentation team states
 directly ([msteams-docs#1451](https://github.com/MicrosoftDocs/msteams-docs/issues/1451),
 closed with "Typing indicator is only supported in 1:1 and group chat. It is not
@@ -713,8 +438,6 @@ derive, `#[secret]` on the secret field):
 | `path` | String | `"/api/messages"` | webhook route |
 | `allow_dms` | bool | `true` | whether the bot responds in personal (1:1) chats at all; when `false`, inbound personal-chat activities are dropped |
 | `mention_only` | `Option<bool>` | `None` (= true in groups) | group/channel gating only; personal chats are exempt by definition (gated by `allow_dms` instead). Named `mention_only` to match the existing telegram/mattermost convention. |
-| `stream_mode` | `StreamMode` | `Off` | `off` / `partial` (the gray native streaming bubble; 1:1 chats only, groups fall back to typing plus one final reply and team channels to the reply alone); same enum Telegram/Discord/Lark use, whose third value `multi_message` this channel refuses and reads as `off` (§"`multi_message` is not offered") |
-| `draft_update_interval_ms` | u64 | `1500` | draft flush cadence; clears Teams' ~1/s streaming rate limit with the same headroom Microsoft's own SDK buffers to |
 | `interrupt_on_new_message` | bool | `false` | when `true`, a newer message from the same sender in the same conversation cancels the in-flight agent run and starts a fresh response (history preserved); default queues instead. Feeds the orchestrator's `InterruptOnNewMessageConfig`. **Resolved from the `default` alias only** and then applied to every `msteams` alias (`InterruptOnNewMessageConfig` reads `channels.msteams.get("default")`), so a value set on a non-`default` alias has no effect. Per-alias resolution is deferred (§9). |
 
 Multiple aliases (`[channels.msteams.<alias>]`) follow the standard
@@ -733,8 +456,6 @@ channel-wide (see the field note above).
 | `crates/zeroclaw-channels/src/listing.rs` | `ChannelCompileSpec { schema_name: Some("MSTeams"), type_keys: &["msteams"], compiled: cfg!(feature = "channel-msteams") }` |
 | `crates/zeroclaw-config/src/schema.rs` | `MSTeamsConfig` struct + `pub msteams: HashMap<String, MSTeamsConfig>` on the channels struct; add to the `channel.*` allowlist const, `ChannelInfo` list, `has_any_enabled`, row iterator, `Configurable` registration list, `ChannelConfig` impl. |
 | `crates/zeroclaw-api/src/attribution.rs` | `ChannelKind` variant `#[strum(serialize = "msteams")] MsTeams` |
-| `crates/zeroclaw-api/src/channel.rs` | add `supports_draft_updates_for(&self, msg)` to the `Channel` trait **with a default implementation** delegating to `supports_draft_updates()`, so no other channel changes behavior. Teams overrides it because its draft support depends on conversation type; the orchestrator's two draft/typing decision sites call the per-message form. |
-| `crates/zeroclaw-channels/src/paced_channel.rs` | forward `supports_draft_updates_for` to the wrapped channel, so the pacing wrapper does not flatten the per-message answer back to the capability-wide one. |
 | `.github/workflows/ci.yml` | dedicated `test-msteams` lane (`cargo nextest run -p zeroclaw-channels --features channel-msteams -E 'test(msteams)'`), added to the `gate` job's `needs` so it is a required check. Necessary because the default lanes never compile the feature. |
 | `src/channels/` re-export | **Deliberately absent.** `mattermost` has a `src/channels/mattermost.rs` shim, but `src/channels/mod.rs` declares only `matrix` and `telegram`, so that file and most of its neighbours are orphans left behind by the crate split and are never compiled. A Teams copy would be dead code. |
 | `Cargo.toml` (workspace root), `Containerfile`, `dev/ci/docker-tags.toml`, `setup.bat` | wherever `channel-mattermost` appears in feature lists, that is the `channels-full` bundle, the `all-features` container tag, and the installer's `all` preset, but deliberately **not** the lean `dist` selection. Consequence: the prebuilt release binaries and the `minimal` / `default-features` / `dist` container tags do **not** carry Teams, while the published `all-features` tag does; operators on a lean artifact build from source with `--features channel-msteams` (or `channels-full`). The user guide states this explicitly. |
@@ -752,9 +473,6 @@ Pre-edit ritual answers for every state-bearing field:
 | JWKS cache | Source of truth is Microsoft's JWKS endpoint; the cached copy is a runtime materialized view. Two independent bounds with separate timestamps: the last *attempt* spaces fetches at least 60s apart regardless of outcome, and the last *success* caps how long a key set may be served at 24h. A stale cache whose mandatory refresh fails or is rate-limited serves nothing. |
 | ConversationReference map | Source of truth is **created here** (delivered by Teams per activity; exists nowhere else in the codebase). In-memory `RwLock<HashMap<String, ConversationReference>>`. |
 | `bot_identity` (id/name) | Source of truth is the platform (first inbound `activity.recipient`). Write-once `std::sync::OnceLock`. `mattermost.rs::bot_identity` answers the same question with a `tokio::sync::OnceCell` because it has to await an API call to learn its own identity; Teams is handed the identity on every inbound activity, so the initialization is synchronous and an async cell would buy nothing. |
-| Draft stream state (`streamId`, `streamSequence` per in-flight draft) | Source of truth is **created here** (assigned by Teams / incremented locally per protocol). Ephemeral per-draft map, removed on finalize/cancel, and removed there whether or not anything reached the wire: nothing revisits a handle the orchestrator has fallen back on, so a preflight failure that returned early would otherwise leave the entry holding this chat's one stream slot. Since an entry is what makes `send_draft` refuse a second concurrent stream, an abandoned turn must not cost the chat the turn that replaced it. A draft that reaches neither call is swept on the next `send_draft` once its stream is older than the two-minute session limit — or, if it never opened one, once its registration is — because nothing calls back into the channel on such a handle and the map would otherwise grow for the life of the process. The sweep therefore only ever drops an entry Teams has already finished with or that never reached the wire, which is what lets it stay synchronous and close nothing. |
-| Draft update pacing (last update per recipient) | Source of truth is **created here** (when this channel last edited a draft). Keyed by recipient rather than by handle, because the interval it enforces is a per-conversation Connector limit rather than a per-draft one. Only the clear that actually removed a draft drops the key: finalize clears twice around its closing request, and the next turn can open a draft in between, whose floor a second clear would otherwise discard. A key whose mark outlived its draft is swept alongside the drafts, but only once it is older than the configured interval, at which point `draft_update_allowed` already answers "allowed" for it and dropping it cannot change what any frame does. |
-| Effective `stream_mode` | Source of truth is `Config`; the accessor resolves it per call and is the one place a refused `multi_message` becomes `off`, so no caller can act on the raw value. Nothing is cached, so a reload takes effect on the next call. One delivery lifecycle owns every draft, which is why no parallel record of "which path owns this handle" exists to keep in sync. |
 
 ## 8. Testing plan
 
@@ -785,33 +503,17 @@ Unit tests (no live Azure):
   mention leaves closes to a single space rather than fusing two words.
 - Gating: `allow_dms` on/off; `mention_only` on/off × personal/channel;
   peer-group allowlist filtering.
-- Streaming (`partial`): informative → streaming → final activity sequence
-  has monotonic `streamSequence` and consistent `streamId` (wiremock);
-  `stream_mode = Off` ⇒ `supports_draft_updates()` is false; group chats and
-  team channels do not open a draft.
-- Refused `multi_message`: the effective mode reads as `off`, the channel
-  reports no draft support (capability-wide and per message, from a personal
-  chat, the one conversation type that would otherwise stream), and
-  `send_draft` hands out no handle, so delivery goes through `send()`.
 - Outbound tag strip: a message that is nothing but a tool-call envelope is
   never posted, while prose that merely talks about the tags is sent verbatim.
 - Typing: `start_typing()` POSTs a bare `typing` activity.
 - Outbound chunking: an in-budget reply is a single unchanged activity; an
   oversize reply splits into chunks that each fit the budget, concatenate
   back to the original, and prefer paragraph/line boundaries. A split reply
-  paces its chunks; an unsplit one does not wait. In `partial`, a frame past
-  the budget is never posted, an oversize finalize takes the bubble down and
-  arrives as ordinary split messages, and an informative line is clamped to
-  both documented bounds while a short one passes through untouched.
-- Bubble takedown: a cancelled draft closes its stream with a `final`
-  message before the delete, on the content it streamed when there is any
-  and on the notice when there is not; a refused finalize and an oversize
-  answer do the same. A takedown Teams refuses is reported rather than
-  swallowed, so a stranded bubble is distinguishable from a removed one.
+  paces its chunks; an unsplit one does not wait.
 - Rate limits: a `429` on a content-bearing send is retried and the message
   still lands; a conversation that stays throttled fails after the attempt
-  budget rather than retrying forever; a throttled streaming frame is skipped
-  without retrying, so the token loop is not stalled. `Retry-After` in
+  budget rather than retrying forever; a throttled typing indicator is
+  skipped without retrying, so it cannot stall the turn. `Retry-After` in
   delay-seconds wins over the local backoff, the HTTP-date form and garbage
   both fall back to it, and the jittered backoff stays inside its documented
   bounds including at shift overflow. One assertion pins the budget to the 2s

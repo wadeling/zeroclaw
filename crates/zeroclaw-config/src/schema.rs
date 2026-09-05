@@ -14960,13 +14960,6 @@ fn default_matrix_message_max_bytes() -> usize {
     48_000
 }
 
-/// Teams caps its streaming API at one request per second; Microsoft's own
-/// Teams AI SDK buffers to 1.5 s rather than sitting on the cap, so the
-/// default keeps the same headroom.
-fn default_msteams_draft_update_interval_ms() -> u64 {
-    1500
-}
-
 /// Telegram bot channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -15693,26 +15686,6 @@ pub struct MSTeamsConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: Option<bool>,
-    /// Streaming mode for progressive response delivery. `off` (default)
-    /// sends one message per turn. `partial` uses Teams' native streaming
-    /// protocol (the gray in-progress bubble) in personal chats; group
-    /// chats and channels fall back to a typing indicator and one final
-    /// reply. `multi_message` is rejected for Teams (each paragraph would
-    /// be a permanent message published from text the outbound leak policy
-    /// has not run over) and falls back to `off` with a warning.
-    #[tab(Behavior)]
-    #[serde(default)]
-    pub stream_mode: StreamMode,
-    /// Minimum interval (ms) between draft updates, applied only when
-    /// `stream_mode = "partial"`. Teams throttles its streaming API to one
-    /// request per second, so lowering this risks `429`s; updates that arrive
-    /// early are skipped rather than queued, which costs nothing because each
-    /// one carries the full response so far. `0` disables the floor.
-    /// Default: `1500`, matching the buffer Microsoft's own Teams AI SDK
-    /// applies over the one-per-second cap.
-    #[tab(Behavior)]
-    #[serde(default = "default_msteams_draft_update_interval_ms")]
-    pub draft_update_interval_ms: u64,
     /// When true, a newer Teams message from the same sender in the same
     /// conversation cancels the in-flight request and starts a fresh
     /// response with preserved history.
@@ -15760,8 +15733,6 @@ impl Default for MSTeamsConfig {
             path: default_msteams_path(),
             allow_dms: true,
             mention_only: None,
-            stream_mode: StreamMode::default(),
-            draft_update_interval_ms: default_msteams_draft_update_interval_ms(),
             interrupt_on_new_message: false,
             proxy_url: None,
             excluded_tools: Vec::new(),

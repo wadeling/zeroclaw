@@ -3916,24 +3916,14 @@ fn truncate_at_unclosed_protocol_fence(s: &str, known_tool_names: &HashSet<Strin
 ///
 /// `known_tool_names` comes from the same registry the final sanitizer reads,
 /// so both boundaries judge a protocol payload by the same tool inventory.
-pub(crate) async fn run_draft_updater(
+async fn run_draft_updater(
     channel: Arc<dyn Channel>,
     reply_target: String,
     draft_id: String,
     known_tool_names: HashSet<String>,
-    config: Arc<Config>,
-    content_format: OutboundContentFormat,
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::DraftEvent>,
 ) {
     use zeroclaw_runtime::agent::loop_::StreamDelta;
-    // The final-response path redacts too, but it runs after a draft frame has
-    // already been displayed, and neither the closing edit nor a cancel can
-    // retract what a reader has seen. A credential the model emits across
-    // several deltas therefore has to be caught on the frame that renders it.
-    let redacted = |text: &str| -> String {
-        let sanitized = sanitize_streaming_draft_text(text, &known_tool_names);
-        redact_channel_outbound_leaks(&sanitized, &config.security.leak_detection, content_format)
-    };
     let mut accumulated = String::new();
     while let Some(event) = rx.recv().await {
         match event {
@@ -3953,7 +3943,7 @@ pub(crate) async fn run_draft_updater(
                 }
             }
             StreamDelta::Status(text) => {
-                let visible = redacted(&text);
+                let visible = sanitize_streaming_draft_text(&text, &known_tool_names);
                 if let Err(e) = channel
                     .update_draft_progress(&reply_target, &draft_id, &visible)
                     .await
@@ -3972,7 +3962,7 @@ pub(crate) async fn run_draft_updater(
             // `run_matrix_single_message_draft_updater`.
             event @ (StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. }) => {
                 if let Some(text) = event.legacy_status() {
-                    let visible = redacted(&text);
+                    let visible = sanitize_streaming_draft_text(&text, &known_tool_names);
                     if let Err(e) = channel
                         .update_draft_progress(&reply_target, &draft_id, &visible)
                         .await
@@ -3995,35 +3985,7 @@ pub(crate) async fn run_draft_updater(
             StreamDelta::Reasoning(_) => {}
             StreamDelta::Text(text) => {
                 accumulated.push_str(&text);
-                // A detector needs enough of a value to recognise it, so the
-                // deltas that build one arrive before any of them looks like a
-                // credential. Publishing the accumulation as it stands would
-                // render that prefix, and a frame cannot be retracted: the
-                // closing edit replaces what is on screen, not what was read.
-                // Holding the pending tail also keeps frames monotonic, since
-                // the redacted value extends the text already shown instead of
-                // contradicting it, which is what Teams requires of a stream.
-                // Under the same switch as the replacement it exists to serve:
-                // withholding buys nothing once nothing will be redacted, and
-                // it would still cost the operator who turned the guardrail
-                // off a draft that trails a credential-shaped tail — one that,
-                // if the value never completes, no later frame releases and
-                // only the final reply resolves.
-                let publishable = if config.security.leak_detection.enabled {
-                    match zeroclaw_runtime::security::incomplete_credential_tail(&accumulated) {
-                        Some(offset) => &accumulated[..offset],
-                        None => accumulated.as_str(),
-                    }
-                } else {
-                    accumulated.as_str()
-                };
-                // Nothing to show yet rather than an empty bubble: the tail is
-                // all there is, and the next delta either completes it or ends
-                // it.
-                if publishable.is_empty() {
-                    continue;
-                }
-                let visible = redacted(publishable);
+                let visible = sanitize_streaming_draft_text(&accumulated, &known_tool_names);
                 if let Err(e) = channel
                     .update_draft(&reply_target, &draft_id, &visible)
                     .await
@@ -4094,7 +4056,7 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OutboundContentFormat {
+enum OutboundContentFormat {
     Markdown,
     PlainText,
 }
@@ -6834,7 +6796,7 @@ async fn process_channel_message_body(
 
     let use_draft_streaming = target_channel
         .as_ref()
-        .is_some_and(|ch| ch.supports_draft_updates_for(&msg));
+        .is_some_and(|ch| ch.supports_draft_updates());
 
     ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"has_target_channel": target_channel.is_some(), "use_draft_streaming": use_draft_streaming})), "Streaming decision");
 
@@ -6879,20 +6841,6 @@ async fn process_channel_message_body(
         None
     };
 
-    // A channel can decline a draft it is capable of, so capability is not the
-    // decision — the returned handle is. Teams allows one stream per chat, so a
-    // second concurrent turn in the same conversation is handed `None` by
-    // design, and any channel's transient `send_draft` failure arrives here as
-    // `None` too. Such a turn is an ordinary non-streaming turn, and the sink
-    // goes with the handle: the runtime skips its draft sends outright rather
-    // than discovering a closed channel one failed send at a time, and nothing
-    // downstream has to re-derive a decision already made here.
-    let (delta_tx, delta_rx) = if draft_message_id.is_some() {
-        (delta_tx, delta_rx)
-    } else {
-        (None, None)
-    };
-
     // Spawn the appropriate handler for the delta channel.
     let draft_updater = if use_draft_streaming {
         // Partial: accumulate text and edit a single draft message.
@@ -6930,22 +6878,8 @@ async fn process_channel_message_body(
                     .iter()
                     .map(|tool| tool.name().to_ascii_lowercase())
                     .collect();
-                // Same leak-detection policy and format the final sanitizer
-                // applies, so a draft frame is redacted to the same standard as
-                // the message that replaces it.
-                let draft_config = Arc::clone(&ctx.prompt_config);
-                let content_format = outbound_content_format_for_channel(&msg.channel);
                 Some(zeroclaw_spawn::spawn!(async move {
-                    run_draft_updater(
-                        channel,
-                        reply_target,
-                        draft_id,
-                        known_tool_names,
-                        draft_config,
-                        content_format,
-                        rx,
-                    )
-                    .await;
+                    run_draft_updater(channel, reply_target, draft_id, known_tool_names, rx).await;
                 }))
             }
         } else {
@@ -6973,18 +6907,10 @@ async fn process_channel_message_body(
 
     // Preserve the existing typing task placement and lifecycle for all other
     // modes. Matrix single-message has already completed its short typing
-    // scope before its first visible draft delivery. The per-message form of
-    // the capability check keeps a channel whose draft support depends on the
-    // conversation (Teams streams in 1:1 chats only) on the typing path for
-    // the conversations where it opens no draft. The handle carries the rest:
-    // a turn the channel declined a draft for shows nothing while it runs, so
-    // keying this on capability alone would suppress typing and tool
-    // notifications for a conversation that would have had a draft but did
-    // not, leaving it silent until the answer lands.
-    let is_partial_draft = (draft_message_id.is_some()
-        && target_channel.as_ref().is_some_and(|ch| {
-            ch.supports_draft_updates_for(&msg) && !ch.supports_multi_message_streaming()
-        }))
+    // scope before its first visible draft delivery.
+    let is_partial_draft = target_channel
+        .as_ref()
+        .is_some_and(|ch| ch.supports_draft_updates() && !ch.supports_multi_message_streaming())
         || matrix_single_message_streaming;
     let typing_controller = if is_partial_draft {
         None
@@ -7723,12 +7649,6 @@ async fn process_channel_message_body(
                             .await
                         {
                             Ok(()) => true,
-                            // Sending the whole answer again, which is safe
-                            // only because an error here means none of it
-                            // arrived. A channel that can fail with part of a
-                            // reply already posted owns that case itself
-                            // instead of reporting it, since this would repeat
-                            // what the recipient can already see.
                             Err(e) => {
                                 ::zeroclaw_log::record!(
                                     WARN,
@@ -17210,10 +17130,6 @@ api_key = "anthropic-key"
         /// what the transport actually received rather than on a sanitizer it
         /// called itself. Progress text lands in `progress_messages`.
         draft_updates: tokio::sync::Mutex<Vec<String>>,
-        /// Report draft support but hand back no handle, which is what Teams
-        /// does for a second concurrent turn in a chat whose one stream is
-        /// taken, and what any channel does when `send_draft` fails.
-        decline_draft: bool,
     }
 
     struct ExpiringTypingChannel {
@@ -17243,15 +17159,6 @@ api_key = "anthropic-key"
                 stall_start_typing: false,
                 stall_stop_typing: false,
                 draft_updates: tokio::sync::Mutex::new(Vec::new()),
-                decline_draft: false,
-            }
-        }
-
-        /// Draft-capable, but declines the draft it is asked for.
-        fn declining_drafts() -> Self {
-            Self {
-                decline_draft: true,
-                ..Self::new(false, false)
             }
         }
 
@@ -17621,9 +17528,6 @@ api_key = "anthropic-key"
                 .lock()
                 .await
                 .push(format!("{}:{}", message.recipient, message.content));
-            if self.decline_draft {
-                return Ok(None);
-            }
             Ok(Some("draft-1".to_string()))
         }
 
@@ -18814,127 +18718,6 @@ api_key = "anthropic-key"
         fn alias(&self) -> &str {
             "SlowModelProvider"
         }
-    }
-
-    /// Streams far more text deltas than the draft queue holds, so a turn that
-    /// was offered a draft and handed none has to finish without one.
-    struct ManyDeltaStreamingModelProvider {
-        deltas: usize,
-    }
-
-    #[async_trait::async_trait]
-    impl ModelProvider for ManyDeltaStreamingModelProvider {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: Option<f64>,
-        ) -> anyhow::Result<String> {
-            Ok(self.answer())
-        }
-
-        fn supports_streaming(&self) -> bool {
-            true
-        }
-
-        fn stream_chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: Option<f64>,
-            _options: zeroclaw_api::model_provider::StreamOptions,
-        ) -> futures_util::stream::BoxStream<
-            'static,
-            zeroclaw_api::model_provider::StreamResult<zeroclaw_api::model_provider::StreamChunk>,
-        > {
-            use futures_util::StreamExt;
-            let deltas = self.deltas;
-            futures_util::stream::iter((0..deltas).map(move |index| {
-                Ok(zeroclaw_api::model_provider::StreamChunk {
-                    delta: format!("d{index} "),
-                    reasoning: None,
-                    is_final: index + 1 == deltas,
-                    token_count: 1,
-                })
-            }))
-            .boxed()
-        }
-    }
-
-    impl ManyDeltaStreamingModelProvider {
-        fn answer(&self) -> String {
-            (0..self.deltas).map(|index| format!("d{index} ")).collect()
-        }
-    }
-
-    impl ::zeroclaw_api::attribution::Attributable for ManyDeltaStreamingModelProvider {
-        fn role(&self) -> ::zeroclaw_api::attribution::Role {
-            ::zeroclaw_api::attribution::Role::Provider(
-                ::zeroclaw_api::attribution::ProviderKind::Model(
-                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
-                ),
-            )
-        }
-        fn alias(&self) -> &str {
-            "ManyDeltaStreamingModelProvider"
-        }
-    }
-
-    /// A channel can report draft support and still decline the draft, which is
-    /// what Teams does for a second concurrent turn in a chat whose single
-    /// stream is already taken, and what any channel does when `send_draft`
-    /// fails. Such a turn is an ordinary one: the delta sink has to go with the
-    /// handle rather than the capability, or the runtime spends the turn
-    /// sending into a queue nobody drains.
-    #[tokio::test]
-    async fn a_turn_whose_draft_was_declined_completes_as_an_ordinary_message() {
-        // More than the 64-entry queue the streaming path allocates.
-        const DELTAS: usize = 200;
-
-        let channel_impl = Arc::new(DraftRecordingChannel::declining_drafts());
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
-            channel,
-            Arc::new(ManyDeltaStreamingModelProvider { deltas: DELTAS }),
-            zeroclaw_config::schema::Config::default(),
-            zeroclaw_config::schema::AliasedAgentConfig::default(),
-            "test-provider",
-            None,
-        );
-
-        process_channel_message(
-            runtime_ctx,
-            message_sent_hook_test_message(),
-            CancellationToken::new(),
-        )
-        .await;
-
-        assert_eq!(
-            channel_impl.draft_messages.lock().await.len(),
-            1,
-            "the draft was offered once and declined"
-        );
-        assert!(
-            channel_impl.draft_updates.lock().await.is_empty(),
-            "there is no draft to update"
-        );
-        assert!(
-            channel_impl.finalized_messages.lock().await.is_empty(),
-            "there is no draft to finalize"
-        );
-        let sent = channel_impl.sent_messages.lock().await;
-        assert_eq!(
-            sent.len(),
-            1,
-            "the answer must arrive as one ordinary message, got {sent:?}"
-        );
-        assert!(
-            sent[0].ends_with(&format!("d{}", DELTAS - 1)),
-            "the ordinary message must carry the whole streamed answer: {:?}",
-            sent[0]
-        );
     }
 
     struct NoReplyModelProvider;
@@ -33987,24 +33770,15 @@ Done."#;
 
     // ── Streaming draft scratchpad sanitization ───────────────────────────
     //
-    // Drafts do not reach
-    // `sanitize_channel_response_for_format_with_leak_detection` (`update_draft`
-    // posts straight to the transport), so `run_draft_updater` runs the same two
-    // passes itself and these pin the draft boundary to the same preservation
-    // contract as final delivery.
+    // Drafts bypass `sanitize_channel_response_for_format_with_leak_detection`
+    // entirely (`update_draft` posts straight to the transport), so these pin
+    // the draft boundary to the same preservation contract as final delivery.
 
     /// An empty tool registry, which is what the parity assertions against
     /// `sanitize_channel_response(text, &[])` require: both boundaries must be
     /// judging the same inventory for the comparison to mean anything.
     fn no_tools() -> HashSet<String> {
         HashSet::new()
-    }
-
-    /// Config for the draft-updater call sites that are asserting scratchpad
-    /// stripping rather than redaction. Leak detection defaults to enabled, so
-    /// this is the production policy, not a bypass.
-    fn draft_config() -> Arc<Config> {
-        Arc::new(Config::default())
     }
 
     /// The reported leak: a `<tool_result>` envelope reaching the user. Both
@@ -34206,8 +33980,6 @@ Done."#;
             "chat-1".to_string(),
             "draft-1".to_string(),
             no_tools(),
-            draft_config(),
-            OutboundContentFormat::Markdown,
             rx,
         )
         .await;
@@ -34232,175 +34004,6 @@ Done."#;
             ["Working on it.".to_string()],
             "status text must reach the transport already stripped of reasoning"
         );
-    }
-
-    /// Production-boundary proof for draft redaction. No single delta looks like
-    /// a credential; only the accumulated text does. The final sanitizer cannot
-    /// cover this case, because by the time it runs the frame carrying the
-    /// assembled secret has already been displayed, and neither the closing edit
-    /// nor a cancel can retract what a reader saw.
-    #[tokio::test]
-    async fn draft_updater_redacts_a_credential_assembled_across_deltas() {
-        use zeroclaw_runtime::agent::loop_::StreamDelta;
-
-        // The same shape `leak_only_guard_still_detects_credential_in_raw_file_uri`
-        // pins, so this test fails on the wiring rather than on detector tuning.
-        const SECRET: &str = "aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
-
-        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
-
-        for delta in [
-            "Cron output: file:///tmp/report.md?to",
-            "ken=aB3xK9mW2p",
-            "Q7vL4nR8sT1yU6hD0jF5cG",
-            " Grab it soon.",
-        ] {
-            tx.send(StreamDelta::Text(delta.to_string())).await.unwrap();
-        }
-        drop(tx);
-
-        run_draft_updater(
-            channel,
-            "chat-1".to_string(),
-            "draft-1".to_string(),
-            no_tools(),
-            draft_config(),
-            OutboundContentFormat::Markdown,
-            rx,
-        )
-        .await;
-
-        let drafts = channel_impl.draft_updates.lock().await;
-        assert!(!drafts.is_empty(), "the transport must have been called");
-        let mut previous = String::new();
-        for (i, text) in drafts.iter().enumerate() {
-            assert!(
-                !text.contains(SECRET),
-                "draft update {i} carried the assembled credential: {text:?}"
-            );
-            // The frame that renders a partial value is the exposure: a
-            // detector needs the whole thing, and by the time the closing edit
-            // redacts it a reader has already seen it. Asserting only on the
-            // last frame proves the value was redacted eventually, not that no
-            // frame showed it.
-            assert!(
-                !text.contains(&SECRET[..8]),
-                "draft update {i} published a raw prefix of the credential: {text:?}"
-            );
-            // Teams rejects a frame that does not contain the one before it,
-            // and withholding a pending value must not retract published text.
-            assert!(
-                text.starts_with(&previous),
-                "draft update {i} does not contain the frame before it: \
-                 {text:?} after {previous:?}"
-            );
-            previous = text.clone();
-        }
-        let last = drafts.last().unwrap();
-        assert!(
-            last.contains("[REDACTED"),
-            "the frame carrying the credential must be redacted: {last:?}"
-        );
-        assert!(
-            last.contains("file:///tmp/report.md?"),
-            "redaction must leave the surrounding text intact: {last:?}"
-        );
-    }
-
-    /// Uppercase keys, which is how an environment file spells them, and a
-    /// value of one repeated character, whose entropy is zero. The entropy
-    /// heuristic therefore cannot fire in either configuration, so the keyed
-    /// pattern is the only thing that can catch this — which is the point:
-    /// the withholding matches a key regardless of case, so a pattern that
-    /// does not would hold the value back and then publish it in the clear,
-    /// leaving the reader worse off than if nothing had been withheld. Both
-    /// halves of the policy are asserted, the draft frames and the final
-    /// reply, because the same miss reaches both.
-    #[tokio::test]
-    async fn draft_updater_redacts_uppercase_keyed_credentials() {
-        use zeroclaw_runtime::agent::loop_::StreamDelta;
-
-        for high_entropy_tokens in [true, false] {
-            for (key, value) in [
-                ("API_KEY", "a".repeat(20)),
-                ("AWS_SECRET_ACCESS_KEY", "a".repeat(40)),
-            ] {
-                let label = format!("{key} with high_entropy_tokens={high_entropy_tokens}");
-                let mut config = Config::default();
-                config.security.leak_detection.high_entropy_tokens = high_entropy_tokens;
-                let config = Arc::new(config);
-
-                let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
-                let channel: Arc<dyn Channel> = channel_impl.clone();
-                let (tx, rx) = tokio::sync::mpsc::channel(16);
-                // Split inside the value, so no single delta carries a
-                // complete credential and the first frame is the one a late
-                // redaction would already have published.
-                for delta in [
-                    format!("Put {key}={}", &value[..6]),
-                    format!("{} in .env.", &value[6..]),
-                ] {
-                    tx.send(StreamDelta::Text(delta)).await.unwrap();
-                }
-                drop(tx);
-
-                run_draft_updater(
-                    channel,
-                    "chat-1".to_string(),
-                    "draft-1".to_string(),
-                    no_tools(),
-                    Arc::clone(&config),
-                    OutboundContentFormat::Markdown,
-                    rx,
-                )
-                .await;
-
-                let drafts = channel_impl.draft_updates.lock().await;
-                assert!(
-                    !drafts.is_empty(),
-                    "{label}: the transport must have been called"
-                );
-                let mut previous = String::new();
-                for (i, text) in drafts.iter().enumerate() {
-                    // Any value character published after the key is the
-                    // exposure, not just the whole value: the frame cannot be
-                    // retracted once read.
-                    assert!(
-                        !text.contains(&format!("{key}=a")),
-                        "{label}: frame {i} published the key and a raw value character: {text:?}"
-                    );
-                    assert!(
-                        text.starts_with(&previous),
-                        "{label}: frame {i} does not contain the frame before it: \
-                         {text:?} after {previous:?}"
-                    );
-                    previous.clone_from(text);
-                }
-                let last = drafts.last().unwrap();
-                assert!(
-                    last.contains("[REDACTED"),
-                    "{label}: the value must be redacted, not withheld forever: {last:?}"
-                );
-                assert!(
-                    last.contains("in .env."),
-                    "{label}: withholding must release the text after the value: {last:?}"
-                );
-
-                // The reported miss reached the final reply too, which runs
-                // the same policy on the whole answer.
-                let final_reply = redact_channel_outbound_leaks(
-                    &format!("Put {key}={value} in .env."),
-                    &config.security.leak_detection,
-                    OutboundContentFormat::Markdown,
-                );
-                assert!(
-                    !final_reply.contains(&format!("{key}=a")),
-                    "{label}: the final reply left the credential in place: {final_reply:?}"
-                );
-            }
-        }
     }
 
     /// The supervisor's contract for a deterministic configuration failure:
@@ -34494,60 +34097,6 @@ Done."#;
         }
     }
 
-    /// Both settings of the switch on one stream, because the cost of
-    /// withholding is only acceptable while it buys something. The value here
-    /// never reaches its threshold, so with the guardrail on the tail is held
-    /// for the rest of the stream and the final reply resolves it; with the
-    /// guardrail off the operator asked for the model's text, and a draft that
-    /// lags a tail nothing will ever redact is not that.
-    #[tokio::test]
-    async fn draft_updater_buffering_follows_the_leak_detection_switch() {
-        use zeroclaw_runtime::agent::loop_::StreamDelta;
-
-        for enabled in [true, false] {
-            let mut config = Config::default();
-            config.security.leak_detection.enabled = enabled;
-            let config = Arc::new(config);
-
-            let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
-            let channel: Arc<dyn Channel> = channel_impl.clone();
-            let (tx, rx) = tokio::sync::mpsc::channel(16);
-            // Well under the 20 characters the `token` pattern needs, so the
-            // tail stays completable to the end of the stream.
-            for delta in ["Use token=", "abc123"] {
-                tx.send(StreamDelta::Text(delta.to_string())).await.unwrap();
-            }
-            drop(tx);
-
-            run_draft_updater(
-                channel,
-                "chat-1".to_string(),
-                "draft-1".to_string(),
-                no_tools(),
-                Arc::clone(&config),
-                OutboundContentFormat::Markdown,
-                rx,
-            )
-            .await;
-
-            let drafts = channel_impl.draft_updates.lock().await;
-            let last = drafts.last().unwrap_or_else(|| {
-                panic!("enabled={enabled}: the transport must have been called")
-            });
-            if enabled {
-                assert!(
-                    !last.contains("token=abc123"),
-                    "enabled: a still-completable tail must be withheld: {last:?}"
-                );
-            } else {
-                assert!(
-                    last.contains("token=abc123"),
-                    "disabled: the operator opted out, so nothing should be buffered: {last:?}"
-                );
-            }
-        }
-    }
-
     #[tokio::test]
     async fn draft_updater_uses_legacy_tool_status_and_ignores_reasoning() {
         use zeroclaw_runtime::agent::loop_::StreamDelta;
@@ -34582,8 +34131,6 @@ Done."#;
             "chat-1".to_string(),
             "draft-1".to_string(),
             no_tools(),
-            draft_config(),
-            OutboundContentFormat::Markdown,
             rx,
         )
         .await;
@@ -34646,8 +34193,6 @@ Done."#;
                 "chat-1".to_string(),
                 "draft-1".to_string(),
                 no_tools(),
-                draft_config(),
-                OutboundContentFormat::Markdown,
                 rx,
             )
             .await;
@@ -34715,8 +34260,6 @@ Done."#;
                 "chat-1".to_string(),
                 "draft-1".to_string(),
                 known.clone(),
-                draft_config(),
-                OutboundContentFormat::Markdown,
                 rx,
             )
             .await;
@@ -34758,8 +34301,6 @@ Done."#;
             "chat-1".to_string(),
             "draft-1".to_string(),
             known,
-            draft_config(),
-            OutboundContentFormat::Markdown,
             rx,
         )
         .await;

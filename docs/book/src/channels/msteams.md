@@ -72,8 +72,6 @@ port = 3978                           # inbound Bot Framework listener
 # Optional behaviour
 # allow_dms = true                    # false = ignore personal (1:1) chats
 # mention_only = true                 # group/channel must @-mention the bot
-# stream_mode = "partial"             # gray "thinking" bubble in 1:1 chats
-# draft_update_interval_ms = 1500
 # interrupt_on_new_message = false
 
 # 2) Who may talk to the bot (Entra object ID preferred)
@@ -179,93 +177,51 @@ the agent, and HTML entities are decoded. Mentions of **other** users are
 unwrapped to their display name (so "@ZeroClaw ask @Alice" reaches the model as
 "ask Alice") rather than dropped.
 
-## Streaming replies
+## While a turn runs
 
-Set `stream_mode = "partial"` for progressive responses:
+Each question gets one reply, posted when the answer is complete. Personal and
+group chats show the ordinary typing indicator while the turn runs; the channel
+re-posts it on the orchestrator's refresh interval, because Teams expires the
+indicator after a few seconds. A team channel shows no indicator at all, since
+Teams has none in a channel for anyone, bot or human, so a long turn there is
+silent until the reply arrives.
 
-- **Personal chats** use Teams' native streaming protocol: a gray
-  in-progress bubble shows status lines ("thinking", tool activity) and
-  accumulating response text, then is replaced by the final message. Status
-  history disappears once the final message lands; this matches the
-  built-in Copilot experience. The stream opens lazily on the first real
-  status line or content chunk, so the bubble never flashes a `...`
-  placeholder; answers that finish before any intermediate update arrive as
-  a single plain message.
-- **Group chats and team channels** don't support native streaming and receive
-  one final reply. This avoids a notification for an initial placeholder (such
-  as `...`) while the completed answer is only an edit. A group chat shows the
-  ordinary typing indicator while the turn runs; a team channel shows nothing,
-  because Teams has no typing indicator in a channel for anyone, bot or human.
+Teams' native streaming protocol (the gray in-progress bubble that Copilot
+uses) is **not** used. See [Why there is no gray bubble](#why-there-is-no-gray-bubble).
 
-Teams allows one streaming response per chat at a time. If a second question
-arrives while the first is still being answered (which happens when
-`interrupt_on_new_message` is off), the second answer is delivered as one
-ordinary message instead of a second gray bubble.
-
-Two turns running at once share one conversation history, which is worth
-knowing before leaving `interrupt_on_new_message` off in a chat that uses
-`partial`. The later turn builds its prompt while the earlier question is still
-unanswered, so the agent tends to answer both in the later reply, and the
-earlier turn then delivers its own answer to the same question again. Turning
-`interrupt_on_new_message` on avoids this: the follow-up cancels the in-flight
-turn, whose bubble is removed, and only the newer question is answered. The
-cost is that any message sent during a slow turn discards it.
-
-Personal-chat updates are throttled by `draft_update_interval_ms` (default
-1500 ms, the same headroom Microsoft's own SDK keeps over the one request per
-second Teams allows on its streaming API). An update that arrives early is
-skipped, which costs nothing because each one carries the full response so far.
-Status lines stop once the answer itself starts streaming, because Teams
-discards informative updates from that point on.
-
-Teams also requires the streamed text to grow monotonically: each update, and
-the final message, must contain what was streamed before it. An agent that runs
-tools mid-answer can compose a final response that is not a continuation of the
-text streamed earlier, and Teams then refuses the final message. When that
-happens the answer is delivered in full as an ordinary message and the
-in-progress bubble is removed, so the reply is never left sitting underneath a
-frozen draft. The only visible difference is that the bubble disappears instead
-of turning into the answer.
-
-The same thing happens to any turn that takes longer than two minutes, which is
-Teams' hard limit on a streaming session. Teams stops the bubble at that point
-and labels it "this response was stopped"; the answer then arrives as an
-ordinary message once the agent finishes, and the stopped bubble is removed.
-Expect this on turns with slow tools.
-
-Removing a bubble takes two steps, because Teams only ends a streaming
-response when the bot sends its closing message: the bubble is closed first
-and the resulting message is then deleted. If the delete does not go through,
-what stays in the conversation is a short line saying the response was
-superseded, rather than a bubble frozen mid-answer whose Stop button no longer
-works.
-
-`stream_mode = "multi_message"` is **not supported on Teams**. Setting it logs a
-warning at startup and behaves as `off`. Paragraph delivery would publish each
-paragraph as a permanent message drawn from mid-turn draft text, and Teams
-cannot recall a message once sent, so the mode needs a review of its own rather
-than arriving alongside unrelated work. Teams offers `off` and `partial` only.
-
-Draft text is redacted under `security.leak_detection` before each update
-reaches Teams, using the same policy applied to a final reply. Redaction alone
-is not enough for a credential the model emits across several streaming chunks,
-because the detector needs enough of the value to recognise it and the chunks
-before that point look clean. Text that could still become one of the
-credentials these patterns name is therefore held back rather than published,
-and released on the update that either completes the value, which is redacted,
-or rules it out. Holding back follows the same `security.leak_detection.enabled`
-switch as the replacement, so turning the guardrail off leaves the draft tracking
-the model rather than lagging a tail nothing will redact. A credential no key
-announces, such as a bare high-entropy token, is still shown until enough of it
-arrives for the heuristic to fire.
-
-Group chats show the ordinary typing indicator while the turn runs, at any
-setting. Team channels show no indicator at all, because Teams has none in a
-channel for anyone, so a long turn there is silent until the reply arrives.
+Two questions asked in quick succession run as two turns over one shared
+conversation history, which is worth knowing before leaving
+`interrupt_on_new_message` off. The later turn builds its prompt while the
+earlier question is still unanswered, so the agent tends to answer both in the
+later reply, and the earlier turn then delivers its own answer to the same
+question again. Turning `interrupt_on_new_message` on avoids this: the
+follow-up cancels the in-flight turn and only the newer question is answered.
+The cost is that any message sent during a slow turn discards it.
 
 `interrupt_on_new_message` is resolved from the `default` alias and applied to
 every `msteams` alias: a value set only on a non-`default` alias is not honored,
 and enabling it on `default` turns it on for all Teams conversations.
+
+## Why there is no gray bubble
+
+Teams' streaming protocol requires every frame to carry the whole response so
+far, and to only extend what the previous frame published. That cannot be
+reconciled with the outbound leak policy in `security.leak_detection`.
+
+A detector needs enough of a value to recognise it, so the frames that build a
+credential arrive before any of them looks like one. Publishing the
+accumulation as it stands renders that prefix, and a frame cannot be retracted:
+the closing message replaces what is on screen, not what a reader has already
+seen. Withholding the pending tail until the value is complete solves it for
+patterns that announce themselves with a key (`api_key = …`), which end at a
+known length. It does not solve it for patterns with no such bound, such as a
+database URL that can span arbitrary text and newlines. There "not yet
+decidable" and "never going to complete" are indistinguishable, so the stream
+would either leak a prefix or stall until the turn ended.
+
+A completed answer has no such boundary: the whole text is redacted once,
+before anything is posted. So Teams gets one reply per turn, and the streaming
+protocol stays unused until the underlying problem has an answer of its own.
 
 ## Long messages
 
@@ -275,19 +231,12 @@ are split into ordered chunks, preferring paragraph, then line, then word
 boundaries, so a long response is delivered in full rather than dropped. A reply
 that fits the budget is sent unchanged as a single message.
 
-Streaming is held to the same ceiling, and a stream cannot be split, since
-every update has to contain the text before it and the bubble closes with a
-single message. So in `partial` an answer that outgrows the budget stops
-updating the bubble, the bubble is removed, and the answer arrives as ordinary
-split messages. Status lines have their own, much smaller limit (1000
-characters) and are shortened with a trailing ellipsis if they exceed it.
-
 A split reply is delivered chunk by chunk, so a failure partway through leaves
-the earlier chunks in the chat. The rest is not resent, and the failed chunk is
-not retried: every post creates a new message, so either would risk showing the
-same text twice. Instead a short notice says the reply is incomplete, and the
-daemon log records how many chunks were delivered. A failure with nothing
-delivered is an ordinary send failure and the reply is retried in full.
+the earlier chunks in the chat and the rest undelivered. The failed chunk is
+not retried past its throttle budget and the reply is not resent: every post
+creates a new message, so either would risk showing the same text twice. The
+daemon logs the failure, which is the signal to look for when a Teams reply
+stops mid-answer.
 
 ## Proxying
 
@@ -300,20 +249,16 @@ connects to the endpoint you registered rather than the other way round.
 ## Rate limits
 
 Teams allows a bot 7 sends per second in one conversation, with tighter budgets
-over longer windows (8 per 2 seconds, 60 per 30 seconds, 1800 per hour). That is
-separate from the 1 request per second its streaming API allows. Pacing is
-handled for you: the chunks of a split reply are spaced 500 ms apart, so a long
-answer cannot trip a window on its own.
+over longer windows (8 per 2 seconds, 60 per 30 seconds, 1800 per hour). Pacing
+is handled for you: the chunks of a split reply are spaced 500 ms apart, so a
+long answer cannot trip a window on its own.
 
-If Teams does throttle an ordinary reply, it is retried a few times, honoring
-the service's `Retry-After` hint, so a brief burst is waited out instead of
-failing the reply. A conversation that stays throttled ends in a logged error
-rather than an unbounded wait. Throttled streaming frames and typing indicators
-are skipped instead of retried, since the next update supersedes them and
-waiting would stall the response. A throttled attempt to close the streaming
-bubble is not retried either: the answer is sent as an ordinary message
-straight away, which is both faster and the only thing that can work once the
-two-minute streaming window has passed.
+If Teams does throttle a reply, it is retried a few times, honoring the
+service's `Retry-After` hint, so a brief burst is waited out instead of failing
+the reply. A conversation that stays throttled ends in a logged error rather
+than an unbounded wait. A throttled typing indicator is skipped instead of
+retried: the reply supersedes it, and waiting would stall the turn it is meant
+to announce.
 
 ## Threading
 

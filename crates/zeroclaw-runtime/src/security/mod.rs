@@ -67,7 +67,7 @@ pub use iam_policy::{IamPolicy, PolicyDecision};
 pub use nevis::{NevisAuthProvider, NevisIdentity};
 // Prompt injection defense exports
 #[allow(unused_imports)]
-pub use leak_detector::{LeakDetector, LeakResult, incomplete_credential_tail};
+pub use leak_detector::{LeakDetector, LeakResult};
 #[allow(unused_imports)]
 pub use prompt_guard::{GuardAction, GuardResult, PromptGuard};
 use zeroclaw_config::schema::LeakDetectionConfig;

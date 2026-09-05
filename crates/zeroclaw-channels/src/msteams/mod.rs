@@ -7,15 +7,17 @@
 //! the Bot Connector API at the `service_url` carried by each inbound
 //! activity, authenticated with a cached Entra client-credentials token.
 //!
-//! Streaming (`stream_mode = "partial"`) drives Teams' native streaming
-//! protocol in personal chats — the gray in-progress bubble fed by
-//! `streaminfo` typing activities, replaced by the final message. The
-//! stream opens lazily on the first real status line or content chunk
-//! (mirroring OpenClaw's `HttpStream`), so no placeholder frame is ever
-//! posted. Group chats and team channels don't open drafts at all and
-//! receive one final reply; a group chat also shows the ordinary typing
-//! indicator, which Teams draws in every conversation type except a team
-//! channel.
+//! Each turn produces one reply, posted when the answer is complete, and a
+//! reply that exceeds Teams' per-activity limit is split across consecutive
+//! messages. While the turn runs, a personal or group chat shows the ordinary
+//! typing indicator; Teams draws no such indicator in a team channel, so one
+//! is not posted there.
+//!
+//! Teams' native streaming protocol (the gray in-progress bubble) is not
+//! used. It requires each frame to carry the whole response so far and to
+//! only extend what the previous frame published, which cannot be reconciled
+//! with redacting a credential the model emits across several frames: the
+//! frame that renders a not-yet-recognizable prefix cannot be retracted.
 //!
 //! Design: `docs/msteams-channel-design.md`.
 
@@ -35,12 +37,10 @@ use axum::{
 };
 use conversation::{ConversationReference, ConversationStore};
 use portable_atomic::{AtomicBool, AtomicU64, Ordering};
-use std::borrow::Cow;
-use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
-use zeroclaw_config::schema::{MSTeamsConfig, StreamMode};
+use zeroclaw_config::schema::MSTeamsConfig;
 
 /// Resolves this alias's `MSTeamsConfig` from canonical config state at
 /// use-time. No snapshot is stored on the channel (see AGENTS.md
@@ -98,110 +98,12 @@ impl std::fmt::Display for MsTeamsListenerFatalError {
 
 impl std::error::Error for MsTeamsListenerFatalError {}
 
-/// How far a chunked reply got.
-///
-/// Teams refuses any single activity past its size limit, so a long reply goes
-/// out as several ordered ones and a failure partway through leaves the earlier
-/// ones in the chat. How many landed is what decides the caller's options:
-/// posting the reply again is only safe while none did, because the Connector
-/// takes no idempotency key and every post creates another message.
-enum ChunkedSend {
-    Delivered,
-    Failed {
-        delivered: usize,
-        total: usize,
-        error: anyhow::Error,
-    },
-}
-
 /// Resolved per-call context for outbound Connector requests.
 struct SendContext {
     reference: ConversationReference,
     base_id: String,
     client: reqwest::Client,
     token: String,
-}
-
-/// Per-draft native-streaming state. Source of truth created here: the
-/// streaminfo sequence counter and the Teams-assigned `streamId` exist
-/// nowhere else and are dropped on finalize/cancel.
-struct DraftStream {
-    /// Conversation this draft streams into, with any `;messageid=`
-    /// suffix stripped. Source of truth created here: the map is keyed by
-    /// draft handle, and nothing else records which chat a draft belongs
-    /// to — which [`MsTeamsChannel::send_draft`] needs, since Teams allows
-    /// only one stream per chat at a time.
-    conversation: String,
-    /// The instant [`TEAMS_STREAM_SESSION_LIMIT`] is counted from:
-    /// registration until an activity opens the stream, then the stream's
-    /// own start. Source of truth created here — nothing else records when a
-    /// stream opened, and `stream_id` says only that one did, not how long
-    /// ago.
-    ///
-    /// A draft is normally removed on finalize or cancel; ageing is what
-    /// lets [`MsTeamsChannel::sweep_expired_draft_state`] drop one that no
-    /// path ever closed, so an abandoned draft costs its chat neither
-    /// streaming nor a map entry for the life of the process. It is re-based
-    /// on open because a stream opens lazily, often a whole tool loop after
-    /// registration: counting from registration would drop an entry whose
-    /// stream started late while that stream is still live on the service,
-    /// and this map holds the only handle to it.
-    session_started_at: std::time::Instant,
-    /// Teams `streamId` — the Connector-assigned id of the first
-    /// activity. `None` while the draft is lazily pending (no activity
-    /// has been POSTed yet).
-    stream_id: Option<String>,
-    /// Next `streamSequence` (starts at 1, monotonic per stream).
-    next_sequence: u64,
-    /// Whether a `streaming` (content) frame has been pushed yet. Teams
-    /// stops rendering informative updates once content streaming
-    /// begins, so later status lines would be discarded on arrival while
-    /// still spending the stream's one-request-per-second budget.
-    content_started: bool,
-    /// The last content frame's text, empty until one is pushed. Source of
-    /// truth created here: nothing else keeps what a partial draft has put
-    /// on screen. Closing a stream needs it, because Teams refuses a final
-    /// message that does not contain what was streamed before it, and an
-    /// abandoned draft has to be closed with something.
-    streamed: String,
-    /// Whether this draft has already reported giving up on streaming
-    /// because the response outgrew a Teams message. Every later delta
-    /// takes the same branch, so the report is made once per draft.
-    size_exceeded: bool,
-}
-
-/// A stream a torn-down draft left on screen: the id to address it by, and
-/// the content already streamed into it, which any closing message has to
-/// contain.
-struct OpenedStream {
-    id: String,
-    streamed: String,
-}
-
-/// A `typing`/`message` activity carrying a Teams `streaminfo` entity
-/// (the native streaming protocol; design §4).
-fn streaming_activity_body(
-    activity_type: &str,
-    text: &str,
-    stream_type: &str,
-    sequence: Option<u64>,
-    stream_id: Option<&str>,
-) -> serde_json::Value {
-    let mut entity = serde_json::json!({
-        "type": "streaminfo",
-        "streamType": stream_type,
-    });
-    if let Some(sequence) = sequence {
-        entity["streamSequence"] = serde_json::Value::from(sequence);
-    }
-    if let Some(stream_id) = stream_id {
-        entity["streamId"] = serde_json::Value::from(stream_id);
-    }
-    serde_json::json!({
-        "type": activity_type,
-        "text": text,
-        "entities": [entity],
-    })
 }
 
 /// Per-message size ceiling for outbound Teams activities, in characters.
@@ -213,50 +115,6 @@ fn streaming_activity_body(
 /// units per `char`) stays well under the hard limit, leaving headroom for the
 /// mention/reaction/JSON-envelope overhead the limit also counts.
 const TEAMS_MAX_MESSAGE_CHARS: usize = 18_000;
-
-/// Ceiling for one informative (status line) frame.
-///
-/// Microsoft states informative messages "must not be more than 1 kb or 1000
-/// characters" without saying how the byte figure is measured, so both bounds
-/// are honoured: a status line is clamped to whichever comes first. ASCII text
-/// is bounded by the character count, non-Latin scripts by the byte count.
-/// Status lines are short in practice; the clamp only has to keep a runaway
-/// tool label from turning every frame of a turn into a rejection.
-const TEAMS_MAX_INFORMATIVE_CHARS: usize = 1_000;
-const TEAMS_MAX_INFORMATIVE_BYTES: usize = 1_024;
-
-/// Teams' hard limit on one streaming session, after which it stops the
-/// bubble and refuses further frames (`403`, `Content stream finished due to
-/// exceeded streaming time`).
-///
-/// Used here to age out a draft that was registered but never finalized or
-/// cancelled: past this point its stream is dead by Teams' own rule, so it can
-/// no longer be the one stream the chat is allowed.
-const TEAMS_STREAM_SESSION_LIMIT: Duration = Duration::from_secs(120);
-
-/// Clamp an informative frame to [`TEAMS_MAX_INFORMATIVE_CHARS`] /
-/// [`TEAMS_MAX_INFORMATIVE_BYTES`], marking a shortened line with an ellipsis
-/// so the truncation reads as deliberate. Borrows when the line already fits.
-fn clamp_informative_text(text: &str) -> Cow<'_, str> {
-    if text.len() <= TEAMS_MAX_INFORMATIVE_BYTES
-        && text.chars().count() <= TEAMS_MAX_INFORMATIVE_CHARS
-    {
-        return Cow::Borrowed(text);
-    }
-    const ELLIPSIS: char = '…';
-    let byte_budget = TEAMS_MAX_INFORMATIVE_BYTES - ELLIPSIS.len_utf8();
-    let char_budget = TEAMS_MAX_INFORMATIVE_CHARS - 1;
-    let end = text
-        .char_indices()
-        .take(char_budget)
-        .take_while(|(idx, ch)| idx + ch.len_utf8() <= byte_budget)
-        .map(|(idx, ch)| idx + ch.len_utf8())
-        .last()
-        .unwrap_or(0);
-    let mut clamped = text[..end].to_string();
-    clamped.push(ELLIPSIS);
-    Cow::Owned(clamped)
-}
 
 /// Minimum spacing between the chunks of one oversize reply.
 ///
@@ -313,37 +171,29 @@ const CONNECTOR_RETRY_BASE_DELAY_MS: u64 = 1_000;
 /// Whether a Connector request may be retried when Teams throttles it.
 ///
 /// Retrying is right only where losing the request loses content, which is
-/// narrower than "carries content". An intermediate streaming frame, a typing
-/// indicator and a draft cancellation are all superseded by whatever comes
-/// next, and their callers already treat any error as "skip"; waiting on them
-/// would only stall the agent's token loop, which is the very cost
-/// `draft_update_interval_ms` skips updates to avoid. The finalize activity
-/// looks like the exception and is not: while it has delivered nothing, the
-/// orchestrator answers a failed finalize by sending the whole answer again,
-/// so the content is covered one layer up. Once part of an oversize answer has
-/// landed that fallback is withheld, and the chunks carrying the rest are the
-/// content's only chance, so they retry.
+/// narrower than "carries content". A typing indicator carries none: it is
+/// superseded by the reply itself, its caller already treats any error as
+/// "skip", and waiting on it would only stall the turn it is meant to
+/// announce. A reply is the opposite — nothing follows it to carry the answer
+/// again — so it waits the throttle out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ThrottlePolicy {
     /// Losing the request loses content with nothing behind it: wait out a
     /// `429` (see [`CONNECTOR_MAX_ATTEMPTS`]) rather than drop it.
     Retry,
-    /// Something behind the request covers it, whether the next frame or a
-    /// caller's fallback: report a `429` immediately so that takes over.
+    /// Something behind the request covers it: report a `429` immediately so
+    /// that takes over.
     FailFast,
 }
 
 /// Ceiling on a single backoff wait, including a `Retry-After` Teams asks
 /// for.
 ///
-/// Every retrying request is a send outside a stream (plain replies, split
-/// chunks), so one deadline covers them all:
-/// the per-turn budget, `channels.message_timeout_secs`, 300s by default.
-/// Requests that carry a `streamId` never reach this ceiling; the two-minute
-/// session limit makes a stream that has begun refusing requests a lost cause,
-/// so those fail fast instead. A 10s ceiling keeps two waits well inside the
-/// turn budget, where obeying an arbitrarily long hint would fail the turn more
-/// surely than giving up early does.
+/// Every retrying request delivers a reply or one of its split chunks, so one
+/// deadline covers them all: the per-turn budget,
+/// `channels.message_timeout_secs`, 300s by default. A 10s ceiling keeps two
+/// waits well inside that budget, where obeying an arbitrarily long hint would
+/// fail the turn more surely than giving up early does.
 const CONNECTOR_RETRY_MAX_DELAY_MS: u64 = 10_000;
 
 /// Split `message` into ordered chunks that each stay within
@@ -424,19 +274,6 @@ pub struct MsTeamsChannel {
     bot_identity: Arc<OnceLock<BotIdentity>>,
     listener_ready: Arc<AtomicBool>,
     connector: tokio::sync::RwLock<Option<ConnectorHandle>>,
-    /// Per-draft Teams streaming state, keyed by the locally assigned
-    /// draft handle returned from `send_draft`. Source of truth created
-    /// here — the handle, streaminfo sequence counter, and (once the
-    /// stream opens) the Teams `streamId` exist nowhere else. Entries are
-    /// removed on finalize/cancel, or swept once expired if a turn reached
-    /// neither ([`MsTeamsChannel::sweep_expired_draft_state`]).
-    draft_streams: parking_lot::Mutex<HashMap<String, DraftStream>>,
-    /// Monotonic source for locally assigned draft handles.
-    draft_counter: AtomicU64,
-    /// Last draft-update instant per recipient, enforcing the
-    /// `draft_update_interval_ms` floor (Teams rate-limits streaming
-    /// updates to roughly one per second).
-    last_draft_update: parking_lot::Mutex<HashMap<String, Instant>>,
     #[cfg(test)]
     token_url_override: Option<String>,
 }
@@ -461,9 +298,6 @@ impl MsTeamsChannel {
             bot_identity: Arc::new(OnceLock::new()),
             listener_ready: Arc::new(AtomicBool::new(false)),
             connector: tokio::sync::RwLock::new(None),
-            draft_streams: parking_lot::Mutex::new(HashMap::new()),
-            draft_counter: AtomicU64::new(0),
-            last_draft_update: parking_lot::Mutex::new(HashMap::new()),
             #[cfg(test)]
             token_url_override: None,
         }
@@ -552,26 +386,6 @@ impl MsTeamsChannel {
             provider: provider.clone(),
         });
         provider
-    }
-
-    /// Effective stream mode, resolved from canonical state.
-    ///
-    /// `multi_message` is not offered on Teams and reads as `off` here, the
-    /// same fallback Lark applies to it. Paragraph delivery publishes each
-    /// paragraph as a permanent message that no later reply can edit or
-    /// recall, drawn from mid-turn draft text — a change in what delivery
-    /// means on this channel, which deserves its own review rather than
-    /// arriving alongside unrelated work. The outbound leak policy that once
-    /// argued against it now runs on every draft frame at the shared
-    /// boundary, so the refusal is a matter of scope, not safety.
-    /// [`Self::listen`] names the fallback in the operator's log once at
-    /// startup; clamping here rather than at startup also covers a config
-    /// reload into the mode.
-    fn stream_mode(&self) -> StreamMode {
-        match self.config().map(|cfg| cfg.stream_mode).unwrap_or_default() {
-            StreamMode::MultiMessage => StreamMode::Off,
-            other => other,
-        }
     }
 
     /// Resolve everything an outbound Connector call needs for
@@ -736,28 +550,21 @@ impl MsTeamsChannel {
         url: &url::Url,
         text: &str,
         in_reply_to: Option<&str>,
-    ) -> ChunkedSend {
+    ) -> Result<()> {
         let chunks = split_message_for_teams(text);
         for (index, chunk) in chunks.iter().enumerate() {
             let mut body = serde_json::json!({ "type": "message", "text": chunk });
             if let Some(reply_to_id) = in_reply_to {
                 body["replyToId"] = serde_json::Value::String(reply_to_id.to_string());
             }
-            if let Err(error) = Self::activity_request(
+            Self::activity_request(
                 ctx,
                 reqwest::Method::POST,
                 url.clone(),
                 &body,
                 ThrottlePolicy::Retry,
             )
-            .await
-            {
-                return ChunkedSend::Failed {
-                    delivered: index,
-                    total: chunks.len(),
-                    error,
-                };
-            }
+            .await?;
             // Spacing goes between chunks, never after the last one: a
             // single-chunk reply is the common case and must not pay for a
             // split it did not need.
@@ -765,62 +572,7 @@ impl MsTeamsChannel {
                 tokio::time::sleep(TEAMS_CHUNK_SEND_SPACING).await;
             }
         }
-        ChunkedSend::Delivered
-    }
-
-    /// Deliver an answer too large to close a stream on, owning what the reader
-    /// is left with.
-    ///
-    /// This is the one delivery whose caller answers an error by sending the
-    /// whole response again. That is right while nothing has been delivered and
-    /// wrong once a chunk has, since the reader would then see that chunk
-    /// twice, and no retry here can repair it either: the failed chunk cannot
-    /// be reposted safely. So a failure with content already on screen is not
-    /// reported as one. The reader is told the reply is incomplete, the log
-    /// carries the failure, and the answer is not repeated.
-    async fn deliver_oversize_answer(ctx: &SendContext, url: &url::Url, text: &str) -> Result<()> {
-        match Self::post_in_chunks(ctx, url, text, None).await {
-            ChunkedSend::Delivered => Ok(()),
-            // Nothing reached the chat, so the caller's fallback is the reply's
-            // last chance and has to see the failure.
-            ChunkedSend::Failed {
-                delivered: 0,
-                error,
-                ..
-            } => Err(error),
-            ChunkedSend::Failed {
-                delivered,
-                total,
-                error,
-            } => {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "delivered": delivered,
-                            "total": total,
-                            "error": format!("{error}"),
-                        })),
-                    "Teams reply delivered in part; the rest is dropped rather than resent"
-                );
-                // Best effort by nature: whatever refused the chunk may refuse
-                // this too, and the reader is no worse off than without it.
-                let body = serde_json::json!({
-                    "type": "message",
-                    "text": Self::truncated_notice(),
-                });
-                let _ = Self::activity_request(
-                    ctx,
-                    reqwest::Method::POST,
-                    url.clone(),
-                    &body,
-                    ThrottlePolicy::FailFast,
-                )
-                .await;
-                Ok(())
-            }
-        }
+        Ok(())
     }
 
     /// Issue a Connector API request; returns the activity id from the
@@ -902,379 +654,6 @@ impl MsTeamsChannel {
                         .and_then(|id| id.as_str().map(str::to_string))
                 }));
         }
-    }
-
-    /// Whether the `draft_update_interval_ms` floor allows an update for
-    /// this recipient right now (`0` disables throttling).
-    fn draft_update_allowed(&self, recipient: &str, interval_ms: u64) -> bool {
-        if interval_ms == 0 {
-            return true;
-        }
-        self.last_draft_update
-            .lock()
-            .get(recipient)
-            .is_none_or(|last| last.elapsed().as_millis() >= u128::from(interval_ms))
-    }
-
-    fn mark_draft_update(&self, recipient: &str) {
-        self.last_draft_update
-            .lock()
-            .insert(recipient.to_string(), Instant::now());
-    }
-
-    /// Drop per-draft state that no live turn can still use, so neither map
-    /// grows for the life of the process.
-    ///
-    /// [`Self::clear_draft_state`] is the only other thing that empties
-    /// them, and a draft the orchestrator neither finalized nor cancelled
-    /// never reaches it. Ageing the entries out there is not possible —
-    /// nothing calls into the channel on that draft again — so the sweep
-    /// belongs on the next turn's way in. [`Channel::send_draft`] is where
-    /// that is: it already walks `draft_streams` to enforce one stream per
-    /// chat, and it runs once per turn rather than once per frame.
-    ///
-    /// Neither removal can change behaviour, and that rests on ageing from
-    /// `session_started_at` rather than from registration. A draft whose
-    /// stream opened more than [`TEAMS_STREAM_SESSION_LIMIT`] ago is one
-    /// Teams has already ended, so it is no longer eligible to hold its
-    /// chat's stream slot and no callback could do anything with the
-    /// `streamId` it carries; a draft that never opened one has nothing on
-    /// screen to take down. Neither needs closing here, which is why the
-    /// sweep stays synchronous and does no I/O on the next turn's way in.
-    ///
-    /// Ageing from registration would break exactly that: because a stream
-    /// opens lazily, a draft can turn two minutes old with a stream only
-    /// seconds into its own session, and dropping it would strand a bubble —
-    /// Stop button included — that no later finalize or cancel could close,
-    /// since both read `stream_id` from the entry this removes. A pacing
-    /// entry older than the configured interval is one
-    /// [`Self::draft_update_allowed`] already answers "allowed" for, and an
-    /// interval of `0` makes it skip the map entirely.
-    fn sweep_expired_draft_state(&self) {
-        self.draft_streams
-            .lock()
-            .retain(|_, draft| draft.session_started_at.elapsed() < TEAMS_STREAM_SESSION_LIMIT);
-        let interval_ms = self.config().map_or(0, |cfg| cfg.draft_update_interval_ms);
-        let mut pacing = self.last_draft_update.lock();
-        if interval_ms == 0 {
-            pacing.clear();
-        } else {
-            pacing.retain(|_, last| last.elapsed().as_millis() < u128::from(interval_ms));
-        }
-    }
-
-    /// Drop all local state for a draft (finalized or cancelled),
-    /// returning the stream it leaves on screen if one ever opened.
-    fn clear_draft_state(&self, recipient: &str, draft_id: &str) -> Option<OpenedStream> {
-        let removed = self.draft_streams.lock().remove(draft_id);
-        // Only when this call is the one that owned the draft. The pacing map
-        // is keyed by recipient rather than by handle, and `finalize_draft`
-        // clears twice: once inside delivery, before the closing activity,
-        // and again on the way out. The freed stream slot lets the next turn
-        // in this chat open its own draft during that request, so a second,
-        // draft-less clear would drop *its* interval floor and let its next
-        // frame go out early. `send_draft` registers a draft before it hands
-        // the handle out, so `removed` is `Some` exactly on the clear that
-        // owns one.
-        if removed.is_some() {
-            self.last_draft_update.lock().remove(recipient);
-        }
-        removed.and_then(|draft| {
-            draft.stream_id.map(|id| OpenedStream {
-                id,
-                streamed: draft.streamed,
-            })
-        })
-    }
-
-    /// Deliver a native-streaming draft's final answer: the closing
-    /// `message` activity when the stream opened, an ordinary message when
-    /// it never did. Called only through [`Channel::finalize_draft`],
-    /// which clears the draft's state for whatever this returns.
-    async fn finalize_streaming_draft(
-        &self,
-        recipient: &str,
-        draft_id: &str,
-        text: &str,
-    ) -> Result<()> {
-        let (_, ctx) = self.send_context(recipient).await?;
-        let text = crate::util::strip_tool_call_tags(text);
-        // No `replyToId` and no thread suffix, unlike the ordinary send the
-        // orchestrator falls back to. Neither is reachable from this method —
-        // the trait passes the draft handle, not the message that started the
-        // turn — and neither would show anything: a partial draft only exists
-        // in a personal chat, where Teams has no threads and renders a
-        // `replyToId` reply as a plain message at the end of the conversation
-        // (visual threading is a channel-only feature). A team-channel turn
-        // never opens a draft, so its threaded reply goes out through `send`,
-        // which does carry the anchor.
-        let url = Self::activities_url(&ctx.reference, &ctx.base_id, None)?;
-
-        let stream = self.clear_draft_state(recipient, draft_id);
-        // A stream carries its answer in one activity and cannot chunk it, so
-        // an oversize response has no way to close the bubble on its own
-        // content: the final message is refused for the same size reason its
-        // frames were. Close it on what already streamed and deliver in split
-        // messages instead. Without this the request is spent only to fail,
-        // and the reply arrives by way of the caller's error fallback.
-        if text.chars().count() > TEAMS_MAX_MESSAGE_CHARS {
-            if let Some(stream) = stream.as_ref() {
-                let _ = Self::close_stream_activity(&ctx, stream, &Self::cancelled_notice()).await;
-            }
-            return Self::deliver_oversize_answer(&ctx, &url, &text).await;
-        }
-        let body = match stream.as_ref() {
-            Some(stream) => {
-                streaming_activity_body("message", &text, "final", None, Some(&stream.id))
-            }
-            None => serde_json::json!({ "type": "message", "text": text }),
-        };
-        // Not waited out, even though it carries the answer: the caller
-        // resends the whole thing through `send()` if this fails, and those
-        // chunks retry. Waiting here would only delay that fallback, and once
-        // the stream has passed its two-minute deadline every attempt is
-        // spent on a session that cannot accept the message anyway.
-        let delivered = Self::activity_request(
-            &ctx,
-            reqwest::Method::POST,
-            url,
-            &body,
-            ThrottlePolicy::FailFast,
-        )
-        .await;
-        if let (Err(_), Some(stream)) = (&delivered, stream.as_ref()) {
-            // A failed finalize is answered by resending the reply as an
-            // ordinary message, so the opened bubble has to go or the answer
-            // lands underneath a draft frozen on whatever streamed last.
-            // Teams refuses a final message that does not extend the content
-            // already streamed, which a tool loop trips whenever its answer
-            // is not a continuation of an earlier text segment, so this is a
-            // routine outcome rather than a rare one. Closing on the streamed
-            // content is the one final message that cannot be refused for
-            // that reason.
-            let _ = Self::close_stream_activity(&ctx, stream, &Self::cancelled_notice()).await;
-        }
-        delivered.map(|_| ())
-    }
-
-    /// POST one streaminfo activity for a draft, opening the Teams
-    /// stream on the first call. The first activity carries real
-    /// content — never a placeholder — mirroring OpenClaw's lazy
-    /// `HttpStream`, so the gray bubble's first visible frame is actual
-    /// status or response text. The sequence counter (and, on open, the
-    /// Teams-assigned `streamId`) is committed only after the request
-    /// succeeds, so a failed open retries as sequence 1.
-    ///
-    /// Committing afterwards means the draft can be finalized, cancelled or
-    /// swept while the open is in flight. Because the id does not exist until
-    /// the response carries it, that cleanup has nothing to close, so this
-    /// method takes the stream down itself rather than leaving a bubble no
-    /// handle refers to.
-    async fn push_stream_activity(
-        &self,
-        recipient: &str,
-        draft_id: &str,
-        text: &str,
-        stream_type: &str,
-    ) -> Result<()> {
-        let Some((sequence, stream_id)) = self
-            .draft_streams
-            .lock()
-            .get(draft_id)
-            .map(|draft| (draft.next_sequence, draft.stream_id.clone()))
-        else {
-            return Ok(());
-        };
-        let (_, ctx) = self.send_context(recipient).await?;
-        let body = streaming_activity_body(
-            "typing",
-            text,
-            stream_type,
-            Some(sequence),
-            stream_id.as_deref(),
-        );
-        let url = Self::activities_url(&ctx.reference, &ctx.base_id, None)?;
-        // An intermediate frame carries the whole response so far and the next
-        // one supersedes it, so a throttled frame is dropped rather than
-        // waited on: blocking here would stall the token loop feeding it.
-        let response_id = Self::activity_request(
-            &ctx,
-            reqwest::Method::POST,
-            url,
-            &body,
-            ThrottlePolicy::FailFast,
-        )
-        .await?;
-
-        // Only this call can know a stream was opened, because the id exists
-        // nowhere until the response carries it back.
-        let opened_here = stream_id.is_none();
-        let mut orphan: Option<String> = None;
-        let mut still_owned = false;
-        {
-            let mut drafts = self.draft_streams.lock();
-            match drafts.get_mut(draft_id) {
-                Some(draft) => {
-                    still_owned = true;
-                    if draft.stream_id.is_none() {
-                        draft.stream_id = Some(response_id.context(
-                            "Teams streaming draft opened but no streamId was returned",
-                        )?);
-                        // Teams' session clock starts when it accepts this
-                        // request, so the sweep ages the entry from here rather
-                        // than from registration — which a tool loop may have
-                        // left well in the past. Reading the instant after the
-                        // round trip puts the local deadline a shade behind the
-                        // service's, so the entry outlives the stream rather
-                        // than the stream outliving its only handle.
-                        draft.session_started_at = std::time::Instant::now();
-                    }
-                    draft.next_sequence = sequence + 1;
-                    if stream_type == "streaming" {
-                        draft.content_started = true;
-                        text.clone_into(&mut draft.streamed);
-                    }
-                }
-                // Finalize, cancel or the sweep took the draft while this
-                // request was in flight. Whichever it was read `stream_id` as
-                // `None` and so had nothing to take down, which leaves the
-                // bubble this call just opened tracked nowhere: this is the
-                // only place its id is ever held. Closing it does not depend on
-                // knowing which path cleared the entry.
-                None => orphan = if opened_here { response_id } else { None },
-            }
-        }
-
-        if let Some(id) = orphan {
-            // `INFO`, not `DEBUG`: a stream now exists on the service, and this
-            // is the only record that it was created and then withdrawn.
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"stream_id": id})),
-                "Teams draft was taken while its stream opened; closing the orphaned bubble"
-            );
-            // A final message has to carry what the bubble already showed, and
-            // an informative frame is not that content, matching what
-            // `cancel_draft` hands to the same call.
-            let stream = OpenedStream {
-                id,
-                streamed: if stream_type == "streaming" {
-                    text.to_string()
-                } else {
-                    String::new()
-                },
-            };
-            return Self::close_stream_activity(&ctx, &stream, &Self::cancelled_notice()).await;
-        }
-
-        // Pacing is the owned draft's interval floor, and cancel and finalize
-        // drop it with the draft. Recording one for a draft that is already
-        // gone — whether or not there was a stream left to close above — would
-        // hand a successor turn a floor it never set.
-        if still_owned {
-            self.mark_draft_update(recipient);
-        }
-        Ok(())
-    }
-
-    /// What an abandoned bubble says when it has no streamed content to
-    /// close on. Only reaches the screen if the delete that follows the
-    /// closing message does not land, so it has to read as an explanation
-    /// rather than as an answer.
-    fn cancelled_notice() -> String {
-        zeroclaw_runtime::i18n::get_required_cli_string("channel-msteams-draft-cancelled")
-    }
-
-    /// Shown after the chunks that did land when the rest of a long reply
-    /// could not be delivered, so the answer does not simply stop mid-sentence
-    /// with nothing to explain it.
-    fn truncated_notice() -> String {
-        zeroclaw_runtime::i18n::get_required_cli_string("channel-msteams-reply-truncated")
-    }
-
-    /// Take an abandoned draft's bubble off the screen.
-    ///
-    /// A delete alone does not do it. Teams accepts one against a live
-    /// stream and answers `2xx`, but that only drops the activity on the
-    /// service: the client goes on rendering the bubble, with a Stop button
-    /// that then reports "can't stop the response" because the stream it
-    /// would stop is gone. The only thing that ends the stream client-side
-    /// is the final message the streaming contract asks for, so send that
-    /// first and delete the ordinary message it leaves behind.
-    ///
-    /// A final message must contain everything already streamed, so the
-    /// closing text is that content when there is any. `notice` covers the
-    /// draft that never got past its status lines, and is what stays on
-    /// screen if the delete does not land.
-    async fn close_stream_activity(
-        ctx: &SendContext,
-        stream: &OpenedStream,
-        notice: &str,
-    ) -> Result<()> {
-        let closing = if stream.streamed.trim().is_empty() {
-            notice
-        } else {
-            stream.streamed.as_str()
-        };
-        let url = Self::activities_url(&ctx.reference, &ctx.base_id, None)?;
-        let body = streaming_activity_body("message", closing, "final", None, Some(&stream.id));
-        // Both requests are cosmetic: the caller has already decided what
-        // the conversation gets instead, and waiting out a throttle here
-        // would only delay it.
-        Self::activity_request(
-            ctx,
-            reqwest::Method::POST,
-            url,
-            &body,
-            ThrottlePolicy::FailFast,
-        )
-        .await
-        .inspect_err(|err| {
-            // Nothing else reports this, since every caller treats the
-            // takedown as best-effort. Left silent, a bubble that
-            // outlived the attempt looks exactly like one that was
-            // removed.
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "stream_id": stream.id,
-                        "error": format!("{err}"),
-                    })),
-                "Teams stream could not be closed; its bubble stays on screen"
-            );
-        })?;
-        Self::delete_stream_activity(ctx, &stream.id).await
-    }
-
-    /// Remove a closed stream's message. Only useful once the stream itself
-    /// has ended: against a live one this reports success and changes
-    /// nothing the user can see (see [`Self::close_stream_activity`]).
-    async fn delete_stream_activity(ctx: &SendContext, stream_id: &str) -> Result<()> {
-        let url = Self::activities_url(&ctx.reference, &ctx.base_id, Some(stream_id))?;
-        Self::activity_request(
-            ctx,
-            reqwest::Method::DELETE,
-            url,
-            &serde_json::Value::Null,
-            ThrottlePolicy::FailFast,
-        )
-        .await
-        .inspect_err(|err| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "stream_id": stream_id,
-                        "error": format!("{err}"),
-                    })),
-                "Teams closing message could not be deleted; it stays in the conversation"
-            );
-        })
-        .map(|_| ())
     }
 
     /// Build the inbound activity router. Split from `listen()` so tests
@@ -1580,10 +959,10 @@ impl Channel for MsTeamsChannel {
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
         // The transport-level backstop Telegram, Discord, WeChat and WhatsApp
-        // Web also keep. The orchestrator strips envelopes from assistant text before
-        // either a draft frame or a finalized reply, but nothing in the trait
-        // obliges a caller to have run that pass, and this method also carries
-        // split chunks. Stripping once here covers all of them.
+        // Web also keep. The orchestrator strips envelopes from assistant text
+        // before a reply, but nothing in the trait obliges a caller to have
+        // run that pass, and this method also carries split chunks. Stripping
+        // once here covers all of them.
         let content = crate::util::strip_tool_call_tags(&message.content);
         // A paragraph that was nothing but an envelope has nothing left to
         // say. Teams rejects an empty activity, and the caller wanted that
@@ -1594,15 +973,7 @@ impl Channel for MsTeamsChannel {
         let (_, ctx) = self.send_context(&message.recipient).await?;
         let conversation_id = Self::conversation_id_for_thread(&ctx, message.thread_ts.as_deref());
         let url = Self::activities_url(&ctx.reference, &conversation_id, None)?;
-        // Nothing behind this call covers a failure, so it is reported as one.
-        // Callers that reach here do not resend on error, which is what makes
-        // reporting a partial failure safe; the oversize finalization handoff,
-        // whose caller does resend, owns its outcome instead (see
-        // [`Self::deliver_oversize_answer`]).
-        match Self::post_in_chunks(&ctx, &url, &content, message.in_reply_to.as_deref()).await {
-            ChunkedSend::Delivered => Ok(()),
-            ChunkedSend::Failed { error, .. } => Err(error),
-        }
+        Self::post_in_chunks(&ctx, &url, &content, message.in_reply_to.as_deref()).await
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
@@ -1634,18 +1005,6 @@ impl Channel for MsTeamsChannel {
                 self.alias, self.alias,
             ))));
         }
-        // Said once here rather than on every draft callback, where
-        // [`Self::stream_mode`] does the actual clamping.
-        if cfg.stream_mode == StreamMode::MultiMessage {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                "msteams: stream_mode=multi_message is not supported; falling back to off (one \
-                 reply per turn). Use stream_mode=partial for the native streaming bubble in \
-                 personal chats."
-            );
-        }
-
         let path = if cfg.path.starts_with('/') {
             cfg.path.clone()
         } else {
@@ -1696,11 +1055,9 @@ impl Channel for MsTeamsChannel {
     /// Show a typing indicator by POSTing a one-shot Bot Framework
     /// `typing` activity. Teams auto-expires the indicator after a few
     /// seconds, so the orchestrator re-invokes this on its refresh
-    /// interval for the duration of the turn. Personal-chat native
-    /// streaming renders its own gray bubble and the orchestrator
-    /// suppresses typing there, so what reaches the wire is a group chat,
-    /// or a personal chat on a turn that opened no draft. A team channel
-    /// draws no indicator at all and is dropped below.
+    /// interval for the duration of the turn. Personal and group chats both
+    /// show it; a team channel draws no indicator at all and is dropped
+    /// below.
     async fn start_typing(&self, recipient: &str) -> Result<()> {
         // A team channel has no typing indicator, for a bot or for a human
         // author. The Connector still takes the activity — it answers 202 and
@@ -1740,282 +1097,6 @@ impl Channel for MsTeamsChannel {
     async fn stop_typing(&self, _recipient: &str) -> Result<()> {
         Ok(())
     }
-
-    fn supports_draft_updates(&self) -> bool {
-        self.stream_mode() != StreamMode::Off
-    }
-
-    fn supports_draft_updates_for(&self, message: &ChannelMessage) -> bool {
-        // Teams' native streaming (the gray bubble) is personal-chat only.
-        // A group chat gets a typing indicator and one final reply; a team
-        // channel gets the final reply alone, since Teams draws no
-        // indicator there ([`Self::start_typing`]).
-        self.stream_mode() == StreamMode::Partial && self.is_direct_message(message)
-    }
-
-    /// Open a streaming draft for the response.
-    ///
-    /// `partial` (personal chats only) registers a lazy native-streaming
-    /// draft. No activity is POSTed here — the placeholder the orchestrator
-    /// passes is dropped, and the Teams stream opens on the first real
-    /// update, so the gray bubble never flashes "..." (fast answers skip the
-    /// stream entirely). Group chats and team channels don't open a draft
-    /// and deliver one final reply, and neither does a personal chat that
-    /// already has a live stream, since Teams allows one per chat.
-    async fn send_draft(&self, message: &SendMessage) -> Result<Option<String>> {
-        match self.stream_mode() {
-            StreamMode::Partial => {
-                // Personal-chat check straight from the in-memory
-                // conversation store; no token acquisition or network
-                // traffic happens until the stream actually opens.
-                let (base_id, _) = activity::split_conversation_id(&message.recipient);
-                if !self
-                    .conversations
-                    .get(base_id)
-                    .is_some_and(|reference| reference.is_personal())
-                {
-                    return Ok(None);
-                }
-                // Before the slot check below reads the map, so a draft some
-                // path abandoned neither answers that check nor stays in
-                // memory behind it.
-                self.sweep_expired_draft_state();
-                let draft_id = format!(
-                    "draft-{}",
-                    self.draft_counter.fetch_add(1, Ordering::Relaxed)
-                );
-                {
-                    let mut drafts = self.draft_streams.lock();
-                    // Teams allows one streaming response per chat at a time,
-                    // and a turn here does not know about its neighbours: with
-                    // `interrupt_on_new_message` off (the default) a follow-up
-                    // that arrives during a slow turn runs alongside it rather
-                    // than replacing it, so both would open a stream in the
-                    // same chat. The second turn goes without one instead —
-                    // the orchestrator then delivers its answer as an ordinary
-                    // message, which is what group chats already do. Opening
-                    // it anyway would not stream either: every frame is spent
-                    // on a stream Teams refuses to start.
-                    if drafts.values().any(|draft| draft.conversation == base_id) {
-                        return Ok(None);
-                    }
-                    drafts.insert(
-                        draft_id.clone(),
-                        DraftStream {
-                            conversation: base_id.to_string(),
-                            session_started_at: std::time::Instant::now(),
-                            stream_id: None,
-                            next_sequence: 1,
-                            content_started: false,
-                            streamed: String::new(),
-                            size_exceeded: false,
-                        },
-                    );
-                }
-                Ok(Some(draft_id))
-            }
-            // `off`, and `multi_message` with it: no draft, so the
-            // orchestrator delivers the answer through `send()`.
-            _ => Ok(None),
-        }
-    }
-
-    /// Stream accumulated content into the draft: open the Teams native
-    /// stream on the first call, push a further cumulative frame on each
-    /// later one (the protocol replaces the bubble's text rather than
-    /// appending to it). Frames stop once the response outgrows a Teams
-    /// message, since none of them could land past that point. Non-fatal
-    /// failures are logged and swallowed: the finalize pass carries the
-    /// whole answer regardless of how many frames reached the wire.
-    async fn update_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
-        if text.trim().is_empty() {
-            return Ok(());
-        }
-        let Some(cfg) = self.config() else {
-            return Ok(());
-        };
-        if !self.draft_update_allowed(recipient, cfg.draft_update_interval_ms) {
-            return Ok(());
-        }
-        // Every frame carries the whole response so far, and Teams holds a
-        // stream to the same size ceiling as a plain message (403
-        // `ContentStreamNotAllowed`, "Message size too large"). Past the
-        // budget no frame can land, so stop spending the stream's
-        // one-per-second budget on rejections: finalize delivers the answer
-        // as split messages instead.
-        let length = text.chars().count();
-        if length > TEAMS_MAX_MESSAGE_CHARS {
-            let first_report = self
-                .draft_streams
-                .lock()
-                .get_mut(message_id)
-                .is_some_and(|draft| !std::mem::replace(&mut draft.size_exceeded, true));
-            if first_report {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({
-                            "chars": length,
-                            "budget": TEAMS_MAX_MESSAGE_CHARS,
-                        })),
-                    "Teams response outgrew a message; streaming stopped, the answer will be split"
-                );
-            }
-            return Ok(());
-        }
-        if let Err(err) = self
-            .push_stream_activity(recipient, message_id, text, "streaming")
-            .await
-        {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"error": format!("{err}")})),
-                "Teams draft update failed"
-            );
-        }
-        Ok(())
-    }
-
-    /// Progress/status line (tool execution etc.), shown as the gray
-    /// informative text over the streaming bubble. Opens the stream if
-    /// this is the draft's first real content.
-    async fn update_draft_progress(
-        &self,
-        recipient: &str,
-        message_id: &str,
-        text: &str,
-    ) -> Result<()> {
-        let Some(cfg) = self.config() else {
-            return Ok(());
-        };
-        if text.trim().is_empty() {
-            return Ok(());
-        }
-        // Teams renders informative updates only up to the first content
-        // frame and discards them afterwards, so a tool loop that resumes
-        // after some answer text has streamed would spend its whole
-        // per-second budget on frames the client throws away.
-        if self
-            .draft_streams
-            .lock()
-            .get(message_id)
-            .is_some_and(|draft| draft.content_started)
-        {
-            return Ok(());
-        }
-        if !self.draft_update_allowed(recipient, cfg.draft_update_interval_ms) {
-            return Ok(());
-        }
-        if let Err(err) = self
-            .push_stream_activity(
-                recipient,
-                message_id,
-                &clamp_informative_text(text),
-                "informative",
-            )
-            .await
-        {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"error": format!("{err}")})),
-                "Teams draft progress update failed"
-            );
-        }
-        Ok(())
-    }
-
-    /// Close the draft with the complete response. If the stream opened,
-    /// post the final `message` activity — Teams replaces the gray
-    /// streaming bubble with a normal message and drops the status
-    /// history. If it never opened (fast answer, no intermediate
-    /// updates), deliver a plain message.
-    ///
-    /// Two paths cannot end that way and take the bubble down instead: an
-    /// answer too large for one activity, which is then delivered as split
-    /// messages, and a final message Teams refuses, which the orchestrator
-    /// answers by resending through [`Channel::send`]. Both live in
-    /// [`Self::finalize_streaming_draft`]. Whatever happens, the draft's
-    /// local state is gone by the time this returns.
-    async fn finalize_draft(
-        &self,
-        recipient: &str,
-        message_id: &str,
-        text: &str,
-        _suppress_voice: bool,
-    ) -> Result<()> {
-        let delivered = self
-            .finalize_streaming_draft(recipient, message_id, text)
-            .await;
-        if let Err(err) = &delivered {
-            // The handle is spent whatever happened, and nothing revisits a
-            // draft the orchestrator has already fallen back on. Delivery
-            // clears the state itself once it owns a context, so this only
-            // fires when a preflight — live config, the conversation
-            // reference, or the Connector token — returned before that
-            // point. Left registered, the entry would hold this chat's one
-            // stream slot until it aged past [`TEAMS_STREAM_SESSION_LIMIT`]
-            // and would never leave the map at all, since removal happens
-            // nowhere else. Clearing is idempotent, so the paths that
-            // already cleared pay nothing.
-            if let Some(stream) = self.clear_draft_state(recipient, message_id) {
-                // Getting a stream back means the preflight failed with the
-                // bubble already up: every path that reaches the wire closes
-                // it and has cleared this state itself. Taking it down needs
-                // the context that could not be resolved, so nothing is
-                // retried and this is the only record that a bubble was left
-                // on screen.
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "stream_id": stream.id,
-                            "error": format!("{err}"),
-                        })),
-                    "Teams draft finalize failed its preflight; its bubble stays on screen"
-                );
-            }
-        }
-        delivered
-    }
-
-    /// Best-effort removal of an abandoned draft, as when
-    /// `interrupt_on_new_message` cancels a turn that a follow-up
-    /// superseded. A draft whose stream never opened has nothing on the
-    /// wire to take down, so cancel just drops its state. Other turns in
-    /// the same conversation keep theirs.
-    async fn cancel_draft(&self, recipient: &str, message_id: &str) -> Result<()> {
-        let Some(stream) = self.clear_draft_state(recipient, message_id) else {
-            return Ok(());
-        };
-        match self.send_context(recipient).await {
-            Ok((_, ctx)) => {
-                Self::close_stream_activity(&ctx, &stream, &Self::cancelled_notice()).await
-            }
-            Err(err) => {
-                // Reported for the same reason a failed close is: a bubble
-                // that outlived the attempt looks exactly like one that was
-                // taken down. Nothing is retried here — taking the stream
-                // off the screen needs the very context that could not be
-                // resolved — so this is the only record that it was left
-                // there. The draft's state is already gone, which is what
-                // keeps the next turn in this chat able to stream.
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "stream_id": stream.id,
-                            "error": format!("{err}"),
-                        })),
-                    "Teams draft cancelled without a Connector context; its bubble stays on screen"
-                );
-                Ok(())
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2023,6 +1104,7 @@ mod tests {
     use super::*;
     use jsonwebtoken::{Algorithm, EncodingKey, Header};
     use serde::Serialize;
+    use std::time::Instant;
     use wiremock::matchers::{body_partial_json, header as header_matcher, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use zeroclaw_api::attribution::Attributable;
@@ -2709,14 +1791,6 @@ mod tests {
         assert!(err.to_string().contains("no conversation reference"));
     }
 
-    fn streaming_config() -> MSTeamsConfig {
-        MSTeamsConfig {
-            stream_mode: StreamMode::Partial,
-            draft_update_interval_ms: 0,
-            ..test_config()
-        }
-    }
-
     async fn mock_token_endpoint(server: &MockServer) {
         Mock::given(method("POST"))
             .and(path("/token"))
@@ -2728,7 +1802,9 @@ mod tests {
             .await;
     }
 
-    fn draft_channel(config: MSTeamsConfig, connector: &MockServer) -> MsTeamsChannel {
+    /// A channel that mints its tokens from the mock connector, so a test can
+    /// exercise a send without reaching the real Entra endpoint.
+    fn connected_channel(config: MSTeamsConfig, connector: &MockServer) -> MsTeamsChannel {
         MsTeamsChannel::new(
             "default",
             Arc::new(move || Some(config.clone())),
@@ -2737,845 +1813,12 @@ mod tests {
         .with_token_url(format!("{}/token", connector.uri()))
     }
 
-    /// A channel whose config block a reload can remove: the resolver then
-    /// has no block to hand back, which is the one `send_context` failure
-    /// that needs no network to reproduce.
-    fn removable_draft_channel(
-        config: MSTeamsConfig,
-        connector: &MockServer,
-    ) -> (
-        MsTeamsChannel,
-        Arc<parking_lot::Mutex<Option<MSTeamsConfig>>>,
-    ) {
-        let live = Arc::new(parking_lot::Mutex::new(Some(config)));
-        let resolver = {
-            let live = Arc::clone(&live);
-            Arc::new(move || live.lock().clone())
-        };
-        let ch = MsTeamsChannel::new("default", resolver, Arc::new(Vec::new))
-            .with_token_url(format!("{}/token", connector.uri()));
-        (ch, live)
-    }
-
     fn record_reference(ch: &MsTeamsChannel, connector: &MockServer, id: &str, kind: &str) {
         ch.conversations.record(ConversationReference {
             service_url: format!("{}/teams/", connector.uri()),
             conversation_id: id.to_string(),
             conversation_type: Some(kind.to_string()),
         });
-    }
-
-    #[test]
-    fn streaming_support_flags_follow_stream_mode() {
-        let connector_dummy = |mode: StreamMode| {
-            MsTeamsChannel::new(
-                "default",
-                Arc::new(move || {
-                    Some(MSTeamsConfig {
-                        stream_mode: mode,
-                        ..MSTeamsConfig::default()
-                    })
-                }),
-                Arc::new(Vec::new),
-            )
-        };
-        let off = connector_dummy(StreamMode::Off);
-        assert!(!off.supports_draft_updates());
-        assert!(!off.supports_multi_message_streaming());
-
-        let partial = connector_dummy(StreamMode::Partial);
-        assert!(partial.supports_draft_updates());
-        assert!(!partial.supports_multi_message_streaming());
-
-        // Teams does not offer paragraph delivery, and the mode reads as
-        // `off` rather than opening a draft nothing here can serve.
-        let multi = connector_dummy(StreamMode::MultiMessage);
-        assert_eq!(multi.stream_mode(), StreamMode::Off);
-        assert!(!multi.supports_draft_updates());
-        assert!(!multi.supports_multi_message_streaming());
-    }
-
-    /// A configured `multi_message` must not reach the draft pipeline at
-    /// all: no handle is issued, so the orchestrator delivers the answer
-    /// through `send()` exactly as `off` does. Asserted from a personal
-    /// chat, the one conversation type that would otherwise stream, and
-    /// through `supports_draft_updates_for`, which the orchestrator consults
-    /// per message.
-    #[tokio::test]
-    async fn multi_message_is_refused_and_delivers_like_off() {
-        let connector = MockServer::start().await;
-        let ch = draft_channel(
-            MSTeamsConfig {
-                stream_mode: StreamMode::MultiMessage,
-                ..streaming_config()
-            },
-            &connector,
-        );
-        record_reference(&ch, &connector, "a:1conv", "personal");
-        let msg = ChannelMessage::new("inbound", "sender", "a:1conv", "hello", "msteams", 0);
-        assert!(
-            !ch.supports_draft_updates_for(&msg),
-            "a refused mode must not claim per-message draft support"
-        );
-        assert!(
-            ch.send_draft(&SendMessage::new("hi", "a:1conv"))
-                .await
-                .unwrap()
-                .is_none(),
-            "a refused mode must not hand out a draft handle"
-        );
-    }
-
-    #[tokio::test]
-    async fn send_draft_returns_none_when_streaming_off() {
-        let ch = MsTeamsChannel::new(
-            "default",
-            Arc::new(|| Some(test_config())),
-            Arc::new(Vec::new),
-        );
-        assert!(
-            ch.send_draft(&SendMessage::new("hi", "a:1conv"))
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    /// Full personal-chat streaming sequence with lazy open: the draft
-    /// itself hits no network; the first real progress line opens the
-    /// stream (sequence 1, no streamId, no placeholder frame), then
-    /// content chunks and the final message carry the Teams-assigned
-    /// streamId with monotonic streamSequence.
-    #[tokio::test]
-    async fn personal_streaming_draft_lifecycle() {
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path("/teams/v3/conversations/a:1conv/activities"))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
-            )
-            .mount(&connector)
-            .await;
-
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        let draft_id = ch
-            .send_draft(&SendMessage::new("...", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            connector.received_requests().await.unwrap().len(),
-            0,
-            "opening a draft must not hit the network"
-        );
-
-        ch.update_draft_progress("a:1conv", &draft_id, "Running tools...")
-            .await
-            .unwrap();
-        ch.update_draft("a:1conv", &draft_id, "Partial answer")
-            .await
-            .unwrap();
-        ch.finalize_draft("a:1conv", &draft_id, "Final answer", false)
-            .await
-            .unwrap();
-
-        let requests = connector.received_requests().await.unwrap();
-        let bodies: Vec<serde_json::Value> = requests
-            .iter()
-            .filter(|r| r.url.path().ends_with("/activities"))
-            .map(|r| serde_json::from_slice(&r.body).unwrap())
-            .collect();
-        assert_eq!(bodies.len(), 3);
-
-        // First visible frame is the real status line, not a placeholder.
-        assert_eq!(bodies[0]["type"], "typing");
-        assert_eq!(bodies[0]["text"], "Running tools...");
-        assert_eq!(bodies[0]["entities"][0]["streamType"], "informative");
-        assert_eq!(bodies[0]["entities"][0]["streamSequence"], 1);
-        assert!(bodies[0]["entities"][0].get("streamId").is_none());
-
-        assert_eq!(bodies[1]["type"], "typing");
-        assert_eq!(bodies[1]["text"], "Partial answer");
-        assert_eq!(bodies[1]["entities"][0]["streamType"], "streaming");
-        assert_eq!(bodies[1]["entities"][0]["streamSequence"], 2);
-        assert_eq!(bodies[1]["entities"][0]["streamId"], "stream-1");
-
-        assert_eq!(bodies[2]["type"], "message");
-        assert_eq!(bodies[2]["text"], "Final answer");
-        assert_eq!(bodies[2]["entities"][0]["streamType"], "final");
-        assert_eq!(bodies[2]["entities"][0]["streamId"], "stream-1");
-
-        assert!(ch.draft_streams.lock().is_empty());
-    }
-
-    /// An oversize answer cannot close a stream on its own content, so
-    /// finalization delivers it as ordered activities. A refusal partway
-    /// through has already put the earlier ones on screen, and the caller
-    /// answers an error by sending the whole answer again, which would repeat
-    /// what the reader can already see. So this delivery owns the outcome: the
-    /// reader is told the reply is incomplete and no error is reported. No
-    /// draft is registered here, so the only requests on the wire are the
-    /// chunks themselves.
-    #[tokio::test]
-    async fn an_oversize_finalization_that_fails_midway_tells_the_reader_not_the_caller() {
-        const MARKER: &str = "CHUNK-ONE-MARKER";
-
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        // First chunk accepted, second refused. A 500 is not retried — only 429
-        // is, and only under `ThrottlePolicy::Retry` — so the request count is
-        // exactly one per chunk.
-        Mock::given(method("POST"))
-            .and(path("/teams/v3/conversations/a:1conv/activities"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
-            .up_to_n_times(1)
-            .mount(&connector)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/teams/v3/conversations/a:1conv/activities"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&connector)
-            .await;
-
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        // Past the per-activity budget, and with no whitespace to split on the
-        // break falls where the budget runs out: exactly two chunks.
-        let oversize = format!("{MARKER}{}", "a".repeat(TEAMS_MAX_MESSAGE_CHARS + 2_000));
-        ch.finalize_draft("a:1conv", "no-such-draft", &oversize, false)
-            .await
-            .expect(
-                "a failure with content already posted must not be reported: the caller \
-                 answers an error by sending the whole answer again",
-            );
-
-        let bodies: Vec<String> = connector
-            .received_requests()
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|r| r.url.path().ends_with("/activities"))
-            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
-            .collect();
-        assert_eq!(
-            bodies.iter().filter(|b| b.contains(MARKER)).count(),
-            1,
-            "the chunk that was accepted must not be posted again"
-        );
-        // Compared against the notice itself rather than its English wording,
-        // which is a Fluent string and so depends on the resolved locale.
-        let notice = MsTeamsChannel::truncated_notice();
-        assert!(
-            bodies.last().is_some_and(|b| b.contains(&notice)),
-            "the reader is told the reply is incomplete rather than left with \
-             an answer that stops mid-sentence: {bodies:?}"
-        );
-    }
-
-    /// The other side of the same branch. Nothing was delivered, so the
-    /// caller's fallback is the answer's last chance and has to see the
-    /// failure; withholding it here would lose the reply outright.
-    #[tokio::test]
-    async fn an_oversize_finalization_that_delivers_nothing_reports_the_failure() {
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path("/teams/v3/conversations/a:1conv/activities"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&connector)
-            .await;
-
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        let oversize = "a".repeat(TEAMS_MAX_MESSAGE_CHARS + 2_000);
-        let err = ch
-            .finalize_draft("a:1conv", "no-such-draft", &oversize, false)
-            .await
-            .expect_err("the first chunk was refused, so nothing was delivered");
-        assert!(
-            format!("{err:#}").contains("500"),
-            "the transport failure must reach the caller: {err:#}"
-        );
-    }
-
-    /// What actually reached Teams, for a credential the model assembles
-    /// across deltas. The withholding that keeps a raw prefix off the wire
-    /// runs at the shared draft boundary, so this drives the real
-    /// [`crate::orchestrator::run_draft_updater`] into a real channel and
-    /// reads the request bodies the Connector received, rather than asserting
-    /// on text a test wrote itself.
-    ///
-    /// Two properties, and the frames have to carry both at once: no frame
-    /// may publish even the leading characters of the value, because a frame
-    /// cannot be retracted once read, and every frame must contain the one
-    /// before it, because Teams rejects a stream that goes backwards. Late
-    /// redaction alone satisfies the second only by violating the first.
-    #[tokio::test]
-    async fn msteams_stream_never_carries_a_raw_credential_prefix() {
-        use zeroclaw_runtime::agent::loop_::StreamDelta;
-
-        // Long enough to match the detector's keyed `api_key` pattern only
-        // once fully assembled, which is the whole difficulty: the deltas
-        // that build it arrive before any of them looks like a credential.
-        const SECRET: &str = "aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
-
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path("/teams/v3/conversations/a:1conv/activities"))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
-            )
-            .mount(&connector)
-            .await;
-
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-        let draft_id = ch
-            .send_draft(&SendMessage::new("...", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-
-        let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ch);
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
-        // The split falls inside the value, so the first delta ends on a
-        // prefix the detector cannot yet recognise.
-        for delta in [
-            "Store it as api_key=aB3xK9mW2p",
-            "Q7vL4nR8sT1yU6hD0jF5cG",
-            " and rotate it after the demo.",
-        ] {
-            tx.send(StreamDelta::Text(delta.to_string())).await.unwrap();
-        }
-        drop(tx);
-
-        crate::orchestrator::run_draft_updater(
-            Arc::clone(&channel),
-            "a:1conv".to_string(),
-            draft_id,
-            std::collections::HashSet::new(),
-            Arc::new(zeroclaw_config::schema::Config::default()),
-            crate::orchestrator::OutboundContentFormat::Markdown,
-            rx,
-        )
-        .await;
-
-        let requests = connector.received_requests().await.unwrap();
-        let frames: Vec<String> = requests
-            .iter()
-            .filter(|r| r.url.path().ends_with("/activities"))
-            .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
-            .filter(|body| body["entities"][0]["streamType"] == "streaming")
-            .map(|body| body["text"].as_str().unwrap_or_default().to_string())
-            .collect();
-        assert!(
-            !frames.is_empty(),
-            "the Connector must have received streaming frames"
-        );
-
-        let mut previous = String::new();
-        for (i, text) in frames.iter().enumerate() {
-            assert!(
-                !text.contains(SECRET),
-                "frame {i} carried the assembled credential: {text:?}"
-            );
-            assert!(
-                !text.contains(&SECRET[..8]),
-                "frame {i} published a raw prefix of the credential: {text:?}"
-            );
-            assert!(
-                text.starts_with(&previous),
-                "frame {i} does not contain the frame before it: \
-                 {text:?} after {previous:?}"
-            );
-            previous.clone_from(text);
-        }
-
-        let last = frames.last().unwrap();
-        assert!(
-            last.contains("[REDACTED"),
-            "the value must reach the wire redacted, not merely withheld: {last:?}"
-        );
-        assert!(
-            last.contains("rotate it after the demo"),
-            "withholding must release the text that follows the value: {last:?}"
-        );
-    }
-
-    /// Teams refuses a final message that does not extend the content
-    /// already streamed, which a tool loop hits whenever its answer is not
-    /// a continuation of an earlier text segment. The caller resends the
-    /// answer as an ordinary message, so finalize has to take the opened
-    /// bubble down first: otherwise the reply lands underneath a draft
-    /// frozen on the last streamed frame. Taking it down means closing the
-    /// stream on the one text Teams cannot refuse, what it already
-    /// streamed, and then deleting the message that leaves.
-    #[tokio::test]
-    async fn a_rejected_finalize_takes_the_abandoned_bubble_down() {
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path("/teams/v3/conversations/a:1conv/activities"))
-            .and(body_partial_json(serde_json::json!({ "type": "typing" })))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
-            )
-            .mount(&connector)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/teams/v3/conversations/a:1conv/activities"))
-            .and(body_partial_json(
-                serde_json::json!({ "type": "message", "text": "Hello" }),
-            ))
-            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
-                "error": {
-                    "code": "ContentStreamNotAllowed",
-                    "message": "Request streamed content should contain the previously streamed content",
-                }
-            })))
-            .mount(&connector)
-            .await;
-        let closed = Mock::given(method("POST"))
-            .and(path("/teams/v3/conversations/a:1conv/activities"))
-            .and(body_partial_json(serde_json::json!({
-                "type": "message",
-                "text": "A brown",
-                "entities": [{ "streamType": "final", "streamId": "stream-1" }],
-            })))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
-            )
-            .expect(1)
-            .named("the abandoned stream is closed on what it streamed");
-        connector.register(closed).await;
-        let deleted = Mock::given(method("DELETE"))
-            .and(path("/teams/v3/conversations/a:1conv/activities/stream-1"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .named("the closed stream's message is deleted");
-        connector.register(deleted).await;
-
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        let draft_id = ch
-            .send_draft(&SendMessage::new("...", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-        ch.update_draft("a:1conv", &draft_id, "A brown")
-            .await
-            .unwrap();
-        let err = ch
-            .finalize_draft("a:1conv", &draft_id, "Hello", false)
-            .await
-            .expect_err("Teams rejects a final message that drops streamed content");
-        assert!(
-            format!("{err}").contains("ContentStreamNotAllowed"),
-            "the caller needs the rejection to trigger its plain-message fallback, got: {err}"
-        );
-
-        // Registered with `.expect(1)`, so the delete is verified on drop.
-        connector.verify().await;
-        assert!(
-            ch.draft_streams.lock().is_empty(),
-            "a finalized draft keeps no state even when the stream is rejected"
-        );
-    }
-
-    /// The rejection above is the case where finalize got far enough to be
-    /// told no. It can also fail before that: `send_context` resolves live
-    /// config, the conversation reference, and an Entra token, and the
-    /// token exchange fails for reasons that have nothing to do with this
-    /// draft — an outage, a throttled token endpoint, a secret rotated to
-    /// the wrong value. The orchestrator answers by resending the reply as
-    /// an ordinary message and never looks at the handle again, so the
-    /// state has to go on the way out. Left registered it holds this
-    /// chat's one stream slot until it ages past
-    /// [`TEAMS_STREAM_SESSION_LIMIT`], and since removal happens nowhere
-    /// else it never leaves the map at all.
-    #[tokio::test]
-    async fn a_finalize_that_cannot_mint_a_token_still_frees_the_chat() {
-        let connector = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/token"))
-            .respond_with(ResponseTemplate::new(503))
-            .mount(&connector)
-            .await;
-
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        let draft_id = ch
-            .send_draft(&SendMessage::new("...", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-        ch.finalize_draft("a:1conv", &draft_id, "Final answer", false)
-            .await
-            .expect_err("without a Connector token nothing can be delivered");
-
-        assert!(
-            ch.draft_streams.lock().is_empty(),
-            "a draft the caller has already fallen back on must keep no state"
-        );
-        assert!(
-            ch.send_draft(&SendMessage::new("next turn", "a:1conv"))
-                .await
-                .unwrap()
-                .is_some(),
-            "the next turn in this chat must still be able to open a stream"
-        );
-    }
-
-    /// The same failure with the bubble already on screen. The token that
-    /// opened the stream is inside its refresh margin by finalize time, so
-    /// closing the bubble needs a fresh one and cannot get it: that bubble
-    /// stays up, and no local state can change it. What must not also
-    /// happen is the chat losing streaming behind a draft nobody will
-    /// finalize again.
-    #[tokio::test]
-    async fn a_finalize_whose_token_expired_frees_the_chat_with_the_bubble_open() {
-        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
-
-        let connector = MockServer::start().await;
-        // Expires inside `CONNECTOR_TOKEN_REFRESH_MARGIN`, so the next call
-        // re-mints rather than serving this one back.
-        Mock::given(method("POST"))
-            .and(path("/token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "connector-tok",
-                "expires_in": 10,
-            })))
-            .up_to_n_times(1)
-            .mount(&connector)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/token"))
-            .respond_with(ResponseTemplate::new(503))
-            .mount(&connector)
-            .await;
-        Mock::given(method("POST"))
-            .and(path(ACTIVITIES))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
-            )
-            .mount(&connector)
-            .await;
-
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        let draft_id = ch
-            .send_draft(&SendMessage::new("...", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-        ch.update_draft("a:1conv", &draft_id, "A brown")
-            .await
-            .unwrap();
-        ch.finalize_draft("a:1conv", &draft_id, "A brown fox", false)
-            .await
-            .expect_err("the expired token cannot be replaced");
-
-        let posted = connector
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .filter(|request| request.url.path() == ACTIVITIES)
-            .count();
-        assert_eq!(
-            posted, 1,
-            "the frame that opened the stream is all the credentials allowed"
-        );
-        assert!(
-            ch.draft_streams.lock().is_empty(),
-            "an opened draft that could not be closed still has to release its slot"
-        );
-        assert!(
-            ch.send_draft(&SendMessage::new("next turn", "a:1conv"))
-                .await
-                .unwrap()
-                .is_some(),
-            "the next turn in this chat must still be able to open a stream"
-        );
-    }
-
-    /// The config lever on the same path, and the one that needs no
-    /// network: an operator deletes `[channels.msteams.default]` and
-    /// reloads mid-turn, so `send_context` has no block to resolve. The
-    /// draft abandoned that way must not outlive the reload that puts the
-    /// section back.
-    #[tokio::test]
-    async fn a_finalize_after_the_config_block_is_removed_still_frees_the_chat() {
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-
-        let (ch, live) = removable_draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        let draft_id = ch
-            .send_draft(&SendMessage::new("...", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-        *live.lock() = None;
-        ch.finalize_draft("a:1conv", &draft_id, "Final answer", false)
-            .await
-            .expect_err("a channel with no config block cannot address the Connector");
-
-        assert!(
-            ch.draft_streams.lock().is_empty(),
-            "the draft must not survive the reload that abandoned it"
-        );
-        *live.lock() = Some(streaming_config());
-        assert!(
-            ch.send_draft(&SendMessage::new("next turn", "a:1conv"))
-                .await
-                .unwrap()
-                .is_some(),
-            "restoring the config must restore streaming for this chat"
-        );
-    }
-
-    /// Cancel has the same ownership problem in the other order: it takes
-    /// the state first and then needs a context to close the bubble with.
-    /// When that context cannot be resolved the cancel still reports
-    /// success, because every caller treats the takedown as best-effort,
-    /// but the state must stay gone — an abandoned turn cannot cost the
-    /// chat the turn that superseded it.
-    #[tokio::test]
-    async fn a_cancel_that_cannot_mint_a_token_still_frees_the_chat() {
-        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
-
-        let connector = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "connector-tok",
-                "expires_in": 10,
-            })))
-            .up_to_n_times(1)
-            .mount(&connector)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/token"))
-            .respond_with(ResponseTemplate::new(503))
-            .mount(&connector)
-            .await;
-        Mock::given(method("POST"))
-            .and(path(ACTIVITIES))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
-            )
-            .mount(&connector)
-            .await;
-
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        let draft_id = ch
-            .send_draft(&SendMessage::new("...", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-        ch.update_draft("a:1conv", &draft_id, "A brown")
-            .await
-            .unwrap();
-        ch.cancel_draft("a:1conv", &draft_id)
-            .await
-            .expect("a takedown nobody can perform is not the caller's failure");
-
-        assert!(
-            ch.draft_streams.lock().is_empty(),
-            "cancel drops the draft's state whether or not the bubble could go"
-        );
-        assert!(
-            ch.send_draft(&SendMessage::new("next turn", "a:1conv"))
-                .await
-                .unwrap()
-                .is_some(),
-            "the turn that superseded this one must be able to stream"
-        );
-    }
-
-    /// Clearing twice is what makes the state release above unconditional,
-    /// and the pacing map is keyed by recipient rather than by handle. The
-    /// clear that no longer owns a draft therefore has to leave that key
-    /// alone: the first clear frees this chat's stream slot, so the next
-    /// turn can open a draft and push a frame while the finalize it belongs
-    /// to is still in flight, and dropping that draft's floor would send its
-    /// next frame inside the one request per second the Connector allows.
-    #[tokio::test]
-    async fn the_clear_that_owns_no_draft_keeps_a_newer_ones_interval_floor() {
-        let connector = MockServer::start().await;
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        let abandoned = ch
-            .send_draft(&SendMessage::new("...", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-        ch.mark_draft_update("a:1conv");
-        ch.clear_draft_state("a:1conv", &abandoned);
-        assert!(
-            ch.last_draft_update.lock().is_empty(),
-            "the clear that owns the draft takes its floor with it"
-        );
-
-        // The next turn, opening while that finalize is still on the wire.
-        let successor = ch
-            .send_draft(&SendMessage::new("...", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-        ch.mark_draft_update("a:1conv");
-
-        // The tail of the first finalize, once its request came back.
-        ch.clear_draft_state("a:1conv", &abandoned);
-        assert!(
-            ch.last_draft_update.lock().contains_key("a:1conv"),
-            "the successor's interval floor must survive a clear that is not its own"
-        );
-        assert!(
-            ch.draft_streams.lock().contains_key(&successor),
-            "and so must the successor itself"
-        );
-    }
-
-    /// A throttled finalize is handed straight to the caller's fallback
-    /// instead of being waited out. Teams reports an expired stream as a
-    /// `429` as readily as a `403`, and once the two-minute session is gone
-    /// every retry is spent on a session that can no longer accept the
-    /// message, delaying the answer the fallback would already have sent.
-    #[tokio::test]
-    async fn a_throttled_finalize_hands_over_without_retrying() {
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path("/teams/v3/conversations/a:1conv/activities"))
-            .and(body_partial_json(serde_json::json!({ "type": "typing" })))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
-            )
-            .mount(&connector)
-            .await;
-        // One attempt only: a retried finalize would raise this count.
-        Mock::given(method("POST"))
-            .and(path("/teams/v3/conversations/a:1conv/activities"))
-            .and(body_partial_json(
-                serde_json::json!({ "type": "message", "text": "Final answer" }),
-            ))
-            .respond_with(ResponseTemplate::new(429).set_body_string("API calls quota exceeded"))
-            .expect(1)
-            .named("finalize is attempted once")
-            .mount(&connector)
-            .await;
-        // This draft never streamed content, only a status line, so the
-        // closing message falls back to the notice.
-        Mock::given(method("POST"))
-            .and(path("/teams/v3/conversations/a:1conv/activities"))
-            .and(body_partial_json(serde_json::json!({
-                "type": "message",
-                "text": MsTeamsChannel::cancelled_notice(),
-            })))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
-            )
-            .expect(1)
-            .named("the expired stream is closed")
-            .mount(&connector)
-            .await;
-        Mock::given(method("DELETE"))
-            .and(path("/teams/v3/conversations/a:1conv/activities/stream-1"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .named("expired bubble is still taken down")
-            .mount(&connector)
-            .await;
-
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        let draft_id = ch
-            .send_draft(&SendMessage::new("...", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-        ch.update_draft_progress("a:1conv", &draft_id, "Running tools...")
-            .await
-            .unwrap();
-
-        let started = Instant::now();
-        let err = ch
-            .finalize_draft("a:1conv", &draft_id, "Final answer", false)
-            .await
-            .expect_err("a throttled finalize is reported, not absorbed");
-        assert!(
-            started.elapsed() < Duration::from_millis(500),
-            "handing over must not wait out a backoff, took {:?}",
-            started.elapsed()
-        );
-        assert!(
-            format!("{err}").contains("429"),
-            "the caller needs the throttle reported to run its fallback, got: {err}"
-        );
-        connector.verify().await;
-    }
-
-    /// Teams stops rendering informative updates once content streaming
-    /// begins and discards later ones, so a tool loop that resumes after
-    /// some answer text has streamed must not spend the stream's
-    /// one-per-second budget on frames the client throws away.
-    #[tokio::test]
-    async fn status_lines_stop_once_content_has_streamed() {
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path("/teams/v3/conversations/a:1conv/activities"))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
-            )
-            .mount(&connector)
-            .await;
-
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        let draft_id = ch
-            .send_draft(&SendMessage::new("...", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-        ch.update_draft_progress("a:1conv", &draft_id, "Running tools...")
-            .await
-            .unwrap();
-        ch.update_draft("a:1conv", &draft_id, "A brown")
-            .await
-            .unwrap();
-        ch.update_draft_progress("a:1conv", &draft_id, "Running more tools...")
-            .await
-            .unwrap();
-        ch.update_draft("a:1conv", &draft_id, "A brown fox")
-            .await
-            .unwrap();
-
-        let requests = connector.received_requests().await.unwrap();
-        let texts =
-            activity_texts_for_path(&requests, "/teams/v3/conversations/a:1conv/activities");
-        assert_eq!(
-            texts,
-            vec!["Running tools...", "A brown", "A brown fox"],
-            "the status line after the first content frame must not be sent"
-        );
     }
 
     /// The strip must not touch a reply that only talks about the tags, which
@@ -3596,7 +1839,7 @@ mod tests {
             .mount(&connector)
             .await;
 
-        let ch = draft_channel(test_config(), &connector);
+        let ch = connected_channel(test_config(), &connector);
         record_reference(&ch, &connector, "a:1conv", "personal");
         ch.send(&SendMessage::new(prose, "a:1conv")).await.unwrap();
 
@@ -3623,7 +1866,7 @@ mod tests {
             .mount(&connector)
             .await;
 
-        let ch = draft_channel(test_config(), &connector);
+        let ch = connected_channel(test_config(), &connector);
         record_reference(&ch, &connector, "a:1conv", "personal");
         ch.send(&SendMessage::new(
             "<tool_call>{\"name\":\"shell\"}</tool_call>",
@@ -3637,224 +1880,6 @@ mod tests {
                 .is_empty(),
             "an envelope-only message must not reach the conversation"
         );
-    }
-
-    /// Microsoft caps an informative frame at "1 kb or 1000 characters", so
-    /// both bounds hold: ASCII trips the character count, other scripts the
-    /// byte count. A line that already fits is passed through untouched.
-    #[test]
-    fn informative_frames_are_clamped_to_both_documented_bounds() {
-        let short = "Running tools...";
-        assert!(matches!(clamp_informative_text(short), Cow::Borrowed(_)));
-        assert_eq!(clamp_informative_text(short), short);
-
-        let ascii = "x".repeat(5_000);
-        let clamped = clamp_informative_text(&ascii);
-        assert!(clamped.chars().count() <= TEAMS_MAX_INFORMATIVE_CHARS);
-        assert!(clamped.len() <= TEAMS_MAX_INFORMATIVE_BYTES);
-        assert!(clamped.ends_with('…'), "a shortened line is marked as such");
-
-        // 1000 CJK characters sit inside the character bound but at three
-        // times the byte bound, so this one has to be cut on bytes.
-        let cjk = "状".repeat(1_000);
-        let clamped = clamp_informative_text(&cjk);
-        assert!(clamped.len() <= TEAMS_MAX_INFORMATIVE_BYTES);
-        assert!(clamped.chars().count() < TEAMS_MAX_INFORMATIVE_CHARS);
-        assert!(clamped.ends_with('…'));
-    }
-
-    /// Every frame carries the whole answer so far and Teams holds a stream
-    /// to the same size ceiling as a plain message, so past that ceiling the
-    /// channel stops pushing frames that could only be refused.
-    #[tokio::test]
-    async fn streaming_frames_stop_once_the_response_outgrows_a_message() {
-        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
-
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path(ACTIVITIES))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
-            )
-            .mount(&connector)
-            .await;
-
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-        let draft_id = ch
-            .send_draft(&SendMessage::new("...", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-
-        ch.update_draft("a:1conv", &draft_id, "A brown")
-            .await
-            .unwrap();
-        let oversize = "x".repeat(TEAMS_MAX_MESSAGE_CHARS + 1);
-        ch.update_draft("a:1conv", &draft_id, &oversize)
-            .await
-            .unwrap();
-        // Every later delta lands in the same branch; the draft reports the
-        // stopped stream once and stays silent afterwards.
-        ch.update_draft("a:1conv", &draft_id, &format!("{oversize}x"))
-            .await
-            .unwrap();
-        assert!(
-            ch.draft_streams
-                .lock()
-                .get(&draft_id)
-                .is_some_and(|draft| draft.size_exceeded)
-        );
-
-        let requests = connector.received_requests().await.unwrap();
-        assert_eq!(
-            activity_texts_for_path(&requests, ACTIVITIES),
-            vec!["A brown".to_string()],
-            "no frame past the size ceiling may be posted"
-        );
-    }
-
-    /// A stream closes with a single activity and cannot chunk it, so an
-    /// oversize answer takes the bubble down and arrives as split plain
-    /// messages rather than as one activity Teams would refuse.
-    #[tokio::test]
-    async fn an_oversize_final_takes_the_bubble_down_and_splits() {
-        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
-
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path(ACTIVITIES))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
-            )
-            .mount(&connector)
-            .await;
-        let deleted = Mock::given(method("DELETE"))
-            .and(path(format!("{ACTIVITIES}/stream-1")))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .named("the bubble a split answer cannot close is deleted");
-        connector.register(deleted).await;
-
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-        let draft_id = ch
-            .send_draft(&SendMessage::new("...", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-        ch.update_draft("a:1conv", &draft_id, "A brown")
-            .await
-            .unwrap();
-
-        let oversize = "x".repeat(TEAMS_MAX_MESSAGE_CHARS + 500);
-        ch.finalize_draft("a:1conv", &draft_id, &oversize, false)
-            .await
-            .expect("an oversize answer is delivered as chunks, not refused");
-
-        let requests = connector.received_requests().await.unwrap();
-        let texts = activity_texts_for_path(&requests, ACTIVITIES);
-        assert_eq!(
-            texts.len(),
-            4,
-            "the opening frame, the message that closes the stream, then a two-way split"
-        );
-        assert_eq!(
-            texts[1], "A brown",
-            "the stream closes on what it streamed, the only text Teams cannot refuse here"
-        );
-        assert_eq!(
-            texts[2..].concat(),
-            oversize,
-            "the answer must arrive whole across the chunks"
-        );
-        let bodies: Vec<serde_json::Value> = requests
-            .iter()
-            .filter(|request| request.url.path() == ACTIVITIES)
-            .map(|request| serde_json::from_slice(&request.body).unwrap())
-            .collect();
-        assert_eq!(
-            bodies[1]["entities"][0]["streamType"], "final",
-            "closing the stream is what ends the bubble; a delete alone does not"
-        );
-        assert!(
-            bodies[2..].iter().all(|body| body["entities"].is_null()),
-            "the chunks are ordinary messages, not a stream's final activity"
-        );
-    }
-
-    /// Fast answers that produce no intermediate updates never open a
-    /// stream: finalize delivers one plain message with no streaminfo.
-    #[tokio::test]
-    async fn draft_without_updates_finalizes_as_plain_message() {
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path("/teams/v3/conversations/a:1conv/activities"))
-            .and(body_partial_json(
-                serde_json::json!({ "type": "message", "text": "Quick answer" }),
-            ))
-            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
-            .expect(1)
-            .mount(&connector)
-            .await;
-
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        let draft_id = ch
-            .send_draft(&SendMessage::new("...", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-        ch.finalize_draft("a:1conv", &draft_id, "Quick answer", false)
-            .await
-            .unwrap();
-
-        let bodies: Vec<serde_json::Value> = connector
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .filter(|r| r.url.path().ends_with("/activities"))
-            .map(|r| serde_json::from_slice(&r.body).unwrap())
-            .collect();
-        assert_eq!(bodies.len(), 1);
-        assert!(
-            bodies[0].get("entities").is_none(),
-            "plain delivery must not carry streaminfo: {}",
-            bodies[0]
-        );
-        assert!(ch.draft_streams.lock().is_empty());
-    }
-
-    #[tokio::test]
-    async fn only_personal_chats_support_partial_drafts() {
-        let connector = MockServer::start().await;
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-        record_reference(&ch, &connector, "19:general@thread.tacv2", "channel");
-
-        let personal = ChannelMessage::new(
-            "inbound-personal",
-            "sender",
-            "a:1conv",
-            "hello",
-            "msteams",
-            0,
-        );
-        let channel = ChannelMessage::new(
-            "inbound-channel",
-            "sender",
-            "19:general@thread.tacv2",
-            "hello",
-            "msteams",
-            0,
-        );
-        assert!(ch.supports_draft_updates_for(&personal));
-        assert!(!ch.supports_draft_updates_for(&channel));
     }
 
     /// Activity texts POSTed to `path`, in order.
@@ -3885,232 +1910,11 @@ mod tests {
             .mount(&connector)
             .await;
 
-        let ch = draft_channel(test_config(), &connector);
+        let ch = connected_channel(test_config(), &connector);
         record_reference(&ch, &connector, "19:group@thread.v2", "groupChat");
 
         ch.start_typing("19:group@thread.v2").await.unwrap();
         ch.stop_typing("19:group@thread.v2").await.unwrap();
-    }
-
-    /// Teams allows one streaming response per chat at a time. Two turns can
-    /// be in flight in one conversation whenever `interrupt_on_new_message`
-    /// is off, so the second must go without a draft rather than open a
-    /// stream Teams will not start.
-    #[tokio::test]
-    async fn a_second_turn_in_one_chat_does_not_open_a_second_stream() {
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-        record_reference(&ch, &connector, "a:2conv", "personal");
-
-        let first = ch
-            .send_draft(&SendMessage::new("hi", "a:1conv"))
-            .await
-            .unwrap();
-        assert!(first.is_some(), "the first turn streams");
-        assert!(
-            ch.send_draft(&SendMessage::new("again", "a:1conv"))
-                .await
-                .unwrap()
-                .is_none(),
-            "a concurrent turn in the same chat must not open a second stream"
-        );
-        // A different chat has its own allowance.
-        assert!(
-            ch.send_draft(&SendMessage::new("hi", "a:2conv"))
-                .await
-                .unwrap()
-                .is_some(),
-            "the limit is per chat, not per bot"
-        );
-
-        // Once the first turn ends, the chat can stream again.
-        ch.cancel_draft("a:1conv", first.as_deref().unwrap())
-            .await
-            .unwrap();
-        assert!(
-            ch.send_draft(&SendMessage::new("next", "a:1conv"))
-                .await
-                .unwrap()
-                .is_some(),
-            "the next turn streams once the previous draft is gone"
-        );
-    }
-
-    /// A draft that no path ever finalized or cancelled must not cost the
-    /// chat its streaming for the life of the process. This one never opened
-    /// a stream, so there is nothing on screen for the removal to strand.
-    #[tokio::test]
-    async fn a_draft_older_than_the_session_limit_stops_blocking_the_chat() {
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        let stale = ch
-            .send_draft(&SendMessage::new("hi", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            ch.send_draft(&SendMessage::new("again", "a:1conv"))
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        if let Some(draft) = ch.draft_streams.lock().get_mut(&stale) {
-            assert!(
-                draft.stream_id.is_none(),
-                "no frame was pushed, so this draft holds no stream"
-            );
-            draft.session_started_at = std::time::Instant::now() - TEAMS_STREAM_SESSION_LIMIT;
-        }
-        let successor = ch
-            .send_draft(&SendMessage::new("later", "a:1conv"))
-            .await
-            .unwrap();
-        assert!(
-            successor.is_some(),
-            "a stream Teams has already ended cannot hold the chat's slot"
-        );
-        // Not just skipped by the slot check: dropped. Nothing calls back
-        // into the channel on an abandoned draft, so if the entry survived
-        // this it would survive for the life of the process.
-        let drafts = ch.draft_streams.lock();
-        assert!(
-            !drafts.contains_key(&stale),
-            "the abandoned draft must leave the map, not merely stop counting"
-        );
-        assert_eq!(drafts.len(), 1, "only the successor may remain");
-    }
-
-    /// A stream opens lazily, so a draft can pass Teams' session limit while
-    /// its stream is seconds old. The sweep runs on any chat's next turn and
-    /// walks every entry, so ageing from registration would drop this one
-    /// mid-answer — and with it the only `streamId` anyone holds, leaving a
-    /// bubble and its Stop button that no finalize or cancel could take down.
-    #[tokio::test]
-    async fn a_sweep_spares_a_draft_whose_stream_opened_late() {
-        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
-
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path(ACTIVITIES))
-            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
-                "id": "stream-1"
-            })))
-            .mount(&connector)
-            .await;
-        // The point of sparing the entry: the handle it carries still works.
-        Mock::given(method("DELETE"))
-            .and(path(format!("{ACTIVITIES}/stream-1")))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&connector)
-            .await;
-
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-        record_reference(&ch, &connector, "b:1conv", "personal");
-
-        let draft_id = ch
-            .send_draft(&SendMessage::new("hi", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-        // A tool loop long enough to outlast the session limit before the
-        // first frame goes out. `message_timeout_secs` defaults to 300, well
-        // past the two minutes, so a turn is allowed to reach this.
-        if let Some(draft) = ch.draft_streams.lock().get_mut(&draft_id) {
-            draft.session_started_at = std::time::Instant::now() - TEAMS_STREAM_SESSION_LIMIT;
-        }
-        ch.update_draft("a:1conv", &draft_id, "half an answer")
-            .await
-            .unwrap();
-
-        // Another chat's turn, which is all it takes to sweep the whole map.
-        assert!(
-            ch.send_draft(&SendMessage::new("hi", "b:1conv"))
-                .await
-                .unwrap()
-                .is_some(),
-            "an unrelated chat is free to stream"
-        );
-
-        {
-            let drafts = ch.draft_streams.lock();
-            let spared = drafts
-                .get(&draft_id)
-                .expect("a draft whose stream just opened is still live");
-            assert_eq!(
-                spared.stream_id.as_deref(),
-                Some("stream-1"),
-                "the spared entry keeps the handle its stream needs"
-            );
-        }
-
-        // Proves the handle survived in usable form, not merely that a map
-        // key did: this is the takedown the dropped entry would have lost.
-        ch.cancel_draft("a:1conv", &draft_id).await.unwrap();
-    }
-
-    /// The pacing map is keyed by recipient and cleared only by the draft
-    /// that owns one, so a turn whose mark outlived its draft would leave a
-    /// key nothing removes. Entries past the interval cannot gate anything
-    /// anyway, which is what makes dropping them free.
-    #[tokio::test]
-    async fn a_pacing_entry_no_draft_owns_does_not_outlive_its_interval() {
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        let mut config = streaming_config();
-        config.draft_update_interval_ms = 50;
-        let ch = draft_channel(config, &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        // The shape the race leaves behind: a mark for a recipient with no
-        // draft to clear it.
-        ch.mark_draft_update("a:9gone");
-        assert!(ch.last_draft_update.lock().contains_key("a:9gone"));
-
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        ch.send_draft(&SendMessage::new("hi", "a:1conv"))
-            .await
-            .unwrap()
-            .expect("a personal chat with no live draft opens one");
-        assert!(
-            ch.last_draft_update.lock().is_empty(),
-            "a pacing entry the interval has already released must be dropped"
-        );
-    }
-
-    /// The sweep must not release a floor that is still holding: an entry
-    /// younger than the interval is the one thing keeping the next frame off
-    /// Teams' ~1/s streaming limit.
-    #[tokio::test]
-    async fn the_sweep_keeps_a_pacing_entry_that_is_still_gating() {
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        let mut config = streaming_config();
-        config.draft_update_interval_ms = 60_000;
-        let ch = draft_channel(config, &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        ch.mark_draft_update("a:1conv");
-        ch.send_draft(&SendMessage::new("hi", "a:1conv"))
-            .await
-            .unwrap()
-            .expect("a personal chat with no live draft opens one");
-        assert!(
-            ch.last_draft_update.lock().contains_key("a:1conv"),
-            "a floor the interval has not released must survive the sweep"
-        );
-        assert!(
-            !ch.draft_update_allowed("a:1conv", 60_000),
-            "and must still refuse the next frame"
-        );
     }
 
     /// Teams draws no typing indicator in a team channel, and the Connector
@@ -4132,7 +1936,7 @@ mod tests {
             .mount(&connector)
             .await;
 
-        let ch = draft_channel(test_config(), &connector);
+        let ch = connected_channel(test_config(), &connector);
         record_reference(&ch, &connector, CONVERSATION, "channel");
 
         ch.start_typing(CONVERSATION).await.unwrap();
@@ -4148,459 +1952,6 @@ mod tests {
             "a team-channel turn must not spend requests on an indicator Teams \
              never renders"
         );
-    }
-
-    #[tokio::test]
-    async fn draft_updates_respect_rate_limit_floor() {
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path("/teams/v3/conversations/a:1conv/activities"))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
-            )
-            .mount(&connector)
-            .await;
-
-        let cfg = MSTeamsConfig {
-            draft_update_interval_ms: 60_000,
-            ..streaming_config()
-        };
-        let ch = draft_channel(cfg, &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        let draft_id = ch
-            .send_draft(&SendMessage::new("hi", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-        // The first update opens the stream; the second lands inside the
-        // 60s window and short-circuits before the network.
-        ch.update_draft("a:1conv", &draft_id, "one").await.unwrap();
-        ch.update_draft("a:1conv", &draft_id, "two").await.unwrap();
-
-        let activity_posts = connector
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .filter(|r| r.url.path().ends_with("/activities"))
-            .count();
-        assert_eq!(
-            activity_posts, 1,
-            "only the stream-opening update may hit the network"
-        );
-    }
-
-    /// Cancelling closes the stream before deleting it. A delete on its own
-    /// is answered `2xx` by Teams and takes the activity off the service,
-    /// but the client keeps rendering the bubble, with a Stop button that
-    /// then fails because the stream it would stop is gone. Only the final
-    /// message ends the stream client-side.
-    #[tokio::test]
-    async fn cancel_draft_closes_the_stream_before_deleting_it() {
-        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
-
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path(ACTIVITIES))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
-            )
-            .mount(&connector)
-            .await;
-        Mock::given(method("DELETE"))
-            .and(path(format!("{ACTIVITIES}/stream-1")))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&connector)
-            .await;
-
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        let draft_id = ch
-            .send_draft(&SendMessage::new("hi", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-        // Open the stream so there is a bubble on screen to take down.
-        ch.update_draft("a:1conv", &draft_id, "partial")
-            .await
-            .unwrap();
-        ch.cancel_draft("a:1conv", &draft_id).await.unwrap();
-
-        let requests = connector.received_requests().await.unwrap();
-        let closing: Vec<serde_json::Value> = requests
-            .iter()
-            .filter(|request| request.url.path() == ACTIVITIES)
-            .map(|request| serde_json::from_slice(&request.body).unwrap())
-            .filter(|body: &serde_json::Value| body["type"] == "message")
-            .collect();
-        assert_eq!(closing.len(), 1, "the stream is closed exactly once");
-        assert_eq!(closing[0]["entities"][0]["streamType"], "final");
-        assert_eq!(closing[0]["entities"][0]["streamId"], "stream-1");
-        assert_eq!(
-            closing[0]["text"], "partial",
-            "a final message must carry what was streamed, so it closes on that"
-        );
-        assert!(ch.draft_streams.lock().is_empty());
-        assert!(ch.last_draft_update.lock().is_empty());
-    }
-
-    /// With nothing streamed but status lines there is no content the
-    /// closing message has to carry, and Teams still needs a final message
-    /// to end the stream. The notice covers it, and only reaches the screen
-    /// if the delete that follows does not land.
-    #[tokio::test]
-    async fn a_draft_that_only_showed_status_closes_on_the_notice() {
-        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
-
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path(ACTIVITIES))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
-            )
-            .mount(&connector)
-            .await;
-        Mock::given(method("DELETE"))
-            .and(path(format!("{ACTIVITIES}/stream-1")))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&connector)
-            .await;
-
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        let draft_id = ch
-            .send_draft(&SendMessage::new("hi", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-        ch.update_draft_progress("a:1conv", &draft_id, "Thinking...")
-            .await
-            .unwrap();
-        ch.cancel_draft("a:1conv", &draft_id).await.unwrap();
-
-        let requests = connector.received_requests().await.unwrap();
-        let closing: Vec<serde_json::Value> = requests
-            .iter()
-            .filter(|request| request.url.path() == ACTIVITIES)
-            .map(|request| serde_json::from_slice(&request.body).unwrap())
-            .filter(|body: &serde_json::Value| body["type"] == "message")
-            .collect();
-        assert_eq!(closing.len(), 1, "the stream is closed exactly once");
-        assert_eq!(
-            closing[0]["text"],
-            MsTeamsChannel::cancelled_notice(),
-            "a status line is not content, so it cannot be what the stream closes on"
-        );
-    }
-
-    /// The interleaving no sequential test reaches: a cancel that lands while
-    /// the opening POST is still in flight. The cancel reads `stream_id` as
-    /// `None`, so it has nothing to take down, and the id then comes back to a
-    /// draft that no longer exists. Left there, Teams renders a bubble whose id
-    /// is held nowhere and which therefore can never be closed.
-    #[tokio::test]
-    async fn a_stream_opened_after_its_draft_was_cancelled_is_taken_down() {
-        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
-
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        // The delay is the race window: long enough that the cancel below is
-        // certain to land while this response is outstanding.
-        Mock::given(method("POST"))
-            .and(path(ACTIVITIES))
-            .respond_with(
-                ResponseTemplate::new(201)
-                    .set_delay(std::time::Duration::from_millis(300))
-                    .set_body_json(serde_json::json!({ "id": "stream-1" })),
-            )
-            .mount(&connector)
-            .await;
-        Mock::given(method("DELETE"))
-            .and(path(format!("{ACTIVITIES}/stream-1")))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&connector)
-            .await;
-
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        let draft_id = ch
-            .send_draft(&SendMessage::new("hi", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-
-        let (update, cancel) = tokio::join!(
-            ch.update_draft("a:1conv", &draft_id, "half an answer"),
-            async {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                ch.cancel_draft("a:1conv", &draft_id).await
-            }
-        );
-        update.unwrap();
-        cancel.unwrap();
-
-        let requests = connector.received_requests().await.unwrap();
-        let closing: Vec<serde_json::Value> = requests
-            .iter()
-            .filter(|request| request.url.path() == ACTIVITIES)
-            .map(|request| serde_json::from_slice(&request.body).unwrap())
-            .filter(|body: &serde_json::Value| body["type"] == "message")
-            .collect();
-        assert_eq!(
-            closing.len(),
-            1,
-            "the orphaned stream must be closed exactly once: {closing:?}"
-        );
-        assert_eq!(
-            closing[0]["text"], "half an answer",
-            "a final message has to carry what the bubble already showed"
-        );
-        assert_eq!(
-            closing[0]["entities"][0]["streamId"], "stream-1",
-            "the closing message must target the stream that was actually opened"
-        );
-
-        assert!(
-            ch.draft_streams.lock().is_empty(),
-            "the cancelled draft must not be resurrected by the late response"
-        );
-        assert!(
-            ch.last_draft_update.lock().is_empty(),
-            "a draft that no longer exists must not leave a pacing floor behind for the next turn"
-        );
-
-        // The freed slot is the point of cancelling: the successor keeps its own
-        // state rather than inheriting anything from the draft that was taken.
-        let successor = ch
-            .send_draft(&SendMessage::new("hi again", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_ne!(successor, draft_id);
-        let drafts = ch.draft_streams.lock();
-        assert_eq!(drafts.len(), 1);
-        let draft = drafts.get(&successor).expect("successor draft is tracked");
-        assert!(
-            draft.stream_id.is_none(),
-            "the successor must start with no stream of its own"
-        );
-        assert_eq!(draft.next_sequence, 1);
-    }
-
-    /// The other half of that interleaving: the stream was already open, so
-    /// the cancel could see it and closed it properly, and the late frame has
-    /// no bubble to clean up. What it must still not do is record a pacing
-    /// floor, because the draft that floor belonged to is gone and the next
-    /// turn would start against an interval it never set.
-    #[tokio::test]
-    async fn a_frame_landing_after_its_draft_was_cancelled_leaves_no_pacing_floor() {
-        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
-
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path(ACTIVITIES))
-            .respond_with(
-                ResponseTemplate::new(201)
-                    .set_delay(std::time::Duration::from_millis(300))
-                    .set_body_json(serde_json::json!({ "id": "stream-1" })),
-            )
-            .mount(&connector)
-            .await;
-        Mock::given(method("DELETE"))
-            .and(path(format!("{ACTIVITIES}/stream-1")))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&connector)
-            .await;
-
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        let draft_id = ch
-            .send_draft(&SendMessage::new("hi", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-        // Opens the stream, so the cancel below has something to take down and
-        // the racing frame is not the one that opened it.
-        ch.update_draft("a:1conv", &draft_id, "first")
-            .await
-            .unwrap();
-        assert!(!ch.last_draft_update.lock().is_empty());
-
-        let (update, cancel) = tokio::join!(
-            ch.update_draft("a:1conv", &draft_id, "first and second"),
-            async {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                ch.cancel_draft("a:1conv", &draft_id).await
-            }
-        );
-        update.unwrap();
-        cancel.unwrap();
-
-        assert!(
-            ch.draft_streams.lock().is_empty(),
-            "the cancelled draft must not be resurrected by the late frame"
-        );
-        assert!(
-            ch.last_draft_update.lock().is_empty(),
-            "the cancel dropped this chat's pacing floor and the late frame must not restore it"
-        );
-    }
-
-    /// The same interleaving under a finalize rather than a cancel. This one
-    /// also has a real answer to deliver, so the takedown of the stream the
-    /// finalize could not see must not cost or duplicate that answer.
-    #[tokio::test]
-    async fn a_stream_opened_after_its_draft_was_finalized_is_taken_down() {
-        const ACTIVITIES: &str = "/teams/v3/conversations/a:1conv/activities";
-
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path(ACTIVITIES))
-            .respond_with(
-                ResponseTemplate::new(201)
-                    .set_delay(std::time::Duration::from_millis(300))
-                    .set_body_json(serde_json::json!({ "id": "stream-1" })),
-            )
-            .mount(&connector)
-            .await;
-        Mock::given(method("DELETE"))
-            .and(path(format!("{ACTIVITIES}/stream-1")))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&connector)
-            .await;
-
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        let draft_id = ch
-            .send_draft(&SendMessage::new("hi", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-
-        let (update, finalize) = tokio::join!(
-            ch.update_draft("a:1conv", &draft_id, "half an answer"),
-            async {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                ch.finalize_draft("a:1conv", &draft_id, "the whole answer", false)
-                    .await
-            }
-        );
-        update.unwrap();
-        finalize.unwrap();
-
-        let requests = connector.received_requests().await.unwrap();
-        let messages: Vec<serde_json::Value> = requests
-            .iter()
-            .filter(|request| request.url.path() == ACTIVITIES)
-            .map(|request| serde_json::from_slice(&request.body).unwrap())
-            .filter(|body: &serde_json::Value| body["type"] == "message")
-            .collect();
-        assert!(
-            messages
-                .iter()
-                .any(|body| body["text"] == "the whole answer"),
-            "the answer the turn produced must still be delivered: {messages:?}"
-        );
-        assert_eq!(
-            messages
-                .iter()
-                .filter(|body| body["entities"][0]["streamId"] == "stream-1")
-                .count(),
-            1,
-            "the orphaned stream must be closed exactly once: {messages:?}"
-        );
-        assert!(
-            ch.draft_streams.lock().is_empty(),
-            "the finalized draft must not be resurrected by the late response"
-        );
-    }
-
-    /// A refused takedown has to reach the caller. Teams ends a stream
-    /// through a final message, the user's Stop button, or the two-minute
-    /// limit, and a delete is not part of that contract, so the bubble can
-    /// well outlive the request. Reporting `Ok` either way would make a
-    /// stranded bubble indistinguishable from a removed one, on the wire and
-    /// in the logs.
-    #[tokio::test]
-    async fn a_refused_bubble_takedown_is_reported_not_swallowed() {
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path("/teams/v3/conversations/a:1conv/activities"))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "stream-1" })),
-            )
-            .mount(&connector)
-            .await;
-        Mock::given(method("DELETE"))
-            .and(path("/teams/v3/conversations/a:1conv/activities/stream-1"))
-            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
-                "error": {
-                    "code": "ContentStreamNotAllowed",
-                    "message": "Content stream finished due to exceeded streaming time.",
-                }
-            })))
-            .expect(1)
-            .mount(&connector)
-            .await;
-
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        let draft_id = ch
-            .send_draft(&SendMessage::new("hi", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-        ch.update_draft("a:1conv", &draft_id, "partial")
-            .await
-            .unwrap();
-
-        let cancelled = ch.cancel_draft("a:1conv", &draft_id).await;
-        assert!(
-            cancelled.is_err(),
-            "a bubble Teams refused to remove must not be reported as cancelled"
-        );
-        // Local state goes regardless: the draft is abandoned either way, and
-        // keeping it would cost the chat its one stream until the entry ages
-        // out.
-        assert!(ch.draft_streams.lock().is_empty());
-        assert!(ch.last_draft_update.lock().is_empty());
-    }
-
-    /// Cancelling a draft whose stream never opened has nothing on the
-    /// wire to delete and must not hit the network at all.
-    #[tokio::test]
-    async fn cancel_unopened_draft_makes_no_network_calls() {
-        let connector = MockServer::start().await;
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-
-        let draft_id = ch
-            .send_draft(&SendMessage::new("hi", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-        ch.cancel_draft("a:1conv", &draft_id).await.unwrap();
-
-        assert!(ch.draft_streams.lock().is_empty());
-        assert!(connector.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4691,7 +2042,7 @@ mod tests {
         let connector = MockServer::start().await;
         mock_token_endpoint(&connector).await;
 
-        let ch = draft_channel(test_config(), &connector);
+        let ch = connected_channel(test_config(), &connector);
         // A service URL that is neither TLS nor loopback. Reaching the
         // network at all would be the failure: the error must come from the
         // guard, not from a DNS or connect attempt. The address is TEST-NET-1
@@ -4811,7 +2162,7 @@ mod tests {
             .mount(&connector)
             .await;
 
-        let ch = draft_channel(test_config(), &connector);
+        let ch = connected_channel(test_config(), &connector);
         record_reference(&ch, &connector, "a:1conv", "personal");
         record_reference(&ch, &connector, "a:warm", "personal");
         // The connector token is fetched once and cached, so acquiring it
@@ -4838,50 +2189,6 @@ mod tests {
         );
     }
 
-    /// A throttled streaming frame is skipped, not waited on. `update_draft`
-    /// is awaited by the agent's token loop, so retrying here would stall
-    /// token delivery for seconds to redeliver a frame the next update
-    /// supersedes anyway.
-    #[tokio::test]
-    async fn throttled_streaming_frame_is_skipped_without_retrying() {
-        let connector = MockServer::start().await;
-        mock_token_endpoint(&connector).await;
-        Mock::given(method("POST"))
-            .and(path("/teams/v3/conversations/a:1conv/activities"))
-            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "30"))
-            .mount(&connector)
-            .await;
-
-        let ch = draft_channel(streaming_config(), &connector);
-        record_reference(&ch, &connector, "a:1conv", "personal");
-        let draft_id = ch
-            .send_draft(&SendMessage::new("hi", "a:1conv"))
-            .await
-            .unwrap()
-            .unwrap();
-
-        let started = Instant::now();
-        ch.update_draft("a:1conv", &draft_id, "partial text")
-            .await
-            .expect("a throttled frame is a skip, not a turn-ending error");
-        let elapsed = started.elapsed();
-
-        let activity_posts = connector
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .filter(|r| r.url.path().ends_with("/activities"))
-            .count();
-        assert_eq!(activity_posts, 1, "the frame must not be re-POSTed");
-        // Honoring the 30s hint here (capped at 10s) would have blocked the
-        // token loop; failing fast returns at once.
-        assert!(
-            elapsed < Duration::from_millis(CONNECTOR_RETRY_BASE_DELAY_MS),
-            "streaming frame blocked for {elapsed:?}"
-        );
-    }
-
     /// The retry budget is bounded: a conversation that stays throttled
     /// gets an error the caller can report, not an unbounded wait.
     #[tokio::test]
@@ -4900,7 +2207,7 @@ mod tests {
             .mount(&connector)
             .await;
 
-        let ch = draft_channel(test_config(), &connector);
+        let ch = connected_channel(test_config(), &connector);
         record_reference(&ch, &connector, "a:1conv", "personal");
 
         let err = ch
@@ -4939,7 +2246,7 @@ mod tests {
             .mount(&connector)
             .await;
 
-        let ch = draft_channel(test_config(), &connector);
+        let ch = connected_channel(test_config(), &connector);
         record_reference(&ch, &connector, "a:1conv", "personal");
 
         // The connector token is fetched once and cached, so acquiring it
