@@ -198,9 +198,8 @@ question again. Turning `interrupt_on_new_message` on avoids this: the
 follow-up cancels the in-flight turn and only the newer question is answered.
 The cost is that any message sent during a slow turn discards it.
 
-`interrupt_on_new_message` is resolved from the `default` alias and applied to
-every `msteams` alias: a value set only on a non-`default` alias is not honored,
-and enabling it on `default` turns it on for all Teams conversations.
+`interrupt_on_new_message` applies to the whole channel: enabling it on any
+`msteams` alias turns it on for all Teams conversations.
 
 ## Why there is no gray bubble
 
