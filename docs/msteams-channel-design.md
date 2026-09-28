@@ -12,7 +12,8 @@
   classifies trust-boundary and `.github/workflows/` changes as High, and
   this PR is both: it adds a new inbound authentication boundary (the
   listener authenticates Bot Connector JWTs and holds the bot's Connector
-  credential) and adds a required CI lane. No existing boundary is
+  credential) and adds a required CI check (the Teams entry in the
+  `test-channel-features` matrix). No existing boundary is
   weakened, but the new one gets focused review.
 - Reference implementations studied:
   - OpenClaw `extensions/msteams/` at `db3213264a` (TypeScript, Bot
@@ -439,6 +440,12 @@ derive, `#[secret]` on the secret field):
 | `allow_dms` | bool | `true` | whether the bot responds in personal (1:1) chats at all; when `false`, inbound personal-chat activities are dropped |
 | `mention_only` | `Option<bool>` | `None` (= true in groups) | group/channel gating only; personal chats are exempt by definition (gated by `allow_dms` instead). Named `mention_only` to match the existing telegram/mattermost convention. |
 | `interrupt_on_new_message` | bool | `false` | when `true`, a newer message from the same sender in the same conversation cancels the in-flight agent run and starts a fresh response (history preserved); default queues instead. Feeds the orchestrator's `InterruptOnNewMessageConfig`. **Applied channel-wide:** it is on for every `msteams` alias if any alias enables it, the same rule every channel uses. Per-alias resolution is deferred (§9). |
+| `proxy_url` | `Option<String>` | `None` | per-channel proxy for every outbound call: Connector sends, the JWKS fetch and the Entra token request (§"Proxy coverage"). Falls back to the global `[proxy]` settings when unset. |
+
+The remaining fields, `excluded_tools`, `reply_min_interval_secs` and
+`reply_queue_depth_max`, are the standard per-channel tool filter and
+`PacedChannel` settings, with the same meaning and defaults as on every other
+channel.
 
 Multiple aliases (`[channels.msteams.<alias>]`) follow the standard
 HashMap pattern; each alias runs its own listener, so aliases must use
@@ -451,15 +458,15 @@ above).
 | Location | Change |
 | --- | --- |
 | `crates/zeroclaw-channels/src/lib.rs` | `#[cfg(feature = "channel-msteams")] pub mod msteams;` |
-| `crates/zeroclaw-channels/Cargo.toml` | `channel-msteams = ["dep:jsonwebtoken"]`; add to the aggregate feature list. `axum`, `reqwest`, `jsonwebtoken` (v10, aws-lc-rs backend) are already dependencies. |
-| `crates/zeroclaw-channels/src/orchestrator/mod.rs` | `pub use crate::msteams::MsTeamsChannel;`; `"msteams" =>` arm in `build_channel_by_id` + `#[cfg(not(...))]` bail arm; configured-channel collection loop; add `msteams` to the "Unknown channel" supported list; add `msteams` field to `InterruptOnNewMessageConfig` (mechanical updates to the many test literals). |
-| `crates/zeroclaw-channels/src/listing.rs` | `ChannelCompileSpec { schema_name: Some("MSTeams"), type_keys: &["msteams"], compiled: cfg!(feature = "channel-msteams") }` |
+| `crates/zeroclaw-channels/Cargo.toml` | `channel-msteams = ["dep:axum", "dep:jsonwebtoken", "dep:thiserror"]`; add to the `channels-full` list. All three are existing optional dependencies of the crate (`jsonwebtoken` v10 on the aws-lc-rs backend), so the feature must enable each one: `axum` is also a dev-dependency, which lets the tests compile without it and would hide a missing entry. `cargo check -p zeroclaw-channels --no-default-features --features channel-msteams --lib` is the check that proves the closure. |
+| `crates/zeroclaw-channels/src/orchestrator/mod.rs` | `pub use crate::msteams::MsTeamsChannel;`; `"msteams" =>` arm in `build_channel_by_id` + `#[cfg(not(...))]` bail arm; configured-channel collection loop; `msteams` arm in `deliver_announcement` for dotted cron delivery refs; `msteams` arm in `is_non_retryable_channel_listener_error` recognising `MsTeamsListenerFatalError`; add `msteams` to the "Unknown channel" supported list; add `msteams` field to `InterruptOnNewMessageConfig` (mechanical updates to the many test literals). |
+| `crates/zeroclaw-channels/src/listing.rs` | `ChannelCompileSpec { schema_name: Some("Microsoft Teams"), type_keys: &["msteams"], compiled: cfg!(feature = "channel-msteams") }` |
 | `crates/zeroclaw-config/src/schema.rs` | `MSTeamsConfig` struct + `pub msteams: HashMap<String, MSTeamsConfig>` on the channels struct; add to the `channel.*` allowlist const, `ChannelInfo` list, `has_any_enabled`, row iterator, `Configurable` registration list, `ChannelConfig` impl. |
 | `crates/zeroclaw-api/src/attribution.rs` | `ChannelKind` variant `#[strum(serialize = "msteams")] MsTeams` |
-| `.github/workflows/ci.yml` | dedicated `test-msteams` lane (`cargo nextest run -p zeroclaw-channels --features channel-msteams -E 'test(msteams)'`), added to the `gate` job's `needs` so it is a required check. Necessary because the default lanes never compile the feature. |
+| `.github/workflows/ci.yml` | a `Microsoft Teams` entry in the `test-channel-features` matrix, shown as `Test (channel Microsoft Teams)`, which runs the `msteams` tests plus the Teams supervisor test and the two channel-registration drift tests with `--features channel-msteams`. The matrix job is in the `gate` job's `needs`, so the entry is a required check. Necessary because no other lane runs these tests: the default `Test` lane does not enable the feature, and `Lint` compiles it under `ci-all` without running it. |
 | `src/channels/` re-export | **Deliberately absent.** `mattermost` has a `src/channels/mattermost.rs` shim, but `src/channels/mod.rs` declares only `matrix` and `telegram`, so that file and most of its neighbours are orphans left behind by the crate split and are never compiled. A Teams copy would be dead code. |
 | `Cargo.toml` (workspace root), `Containerfile`, `dev/ci/docker-tags.toml`, `setup.bat` | wherever `channel-mattermost` appears in feature lists, that is the `channels-full` bundle, the `all-features` container tag, and the installer's `all` preset, but deliberately **not** the lean `dist` selection. Consequence: the prebuilt release binaries and the `minimal` / `default-features` / `dist` container tags do **not** carry Teams, while the published `all-features` tag does; operators on a lean artifact build from source with `--features channel-msteams` (or `channels-full`). The user guide states this explicitly. |
-| `docs/book/src/channels/msteams.md` + `SUMMARY.md` + `overview.md` | user-facing setup guide (separate docs PR) |
+| `docs/book/src/channels/msteams.md` + `SUMMARY.md` + `overview.md` + `docs/book/peer-groups.toml` | user-facing setup guide, its table-of-contents and overview entries, and the peer-group sender description it renders |
 
 ## 7. Single-source-of-truth compliance (AGENTS.md)
 
@@ -526,8 +533,9 @@ Unit tests (no live Azure):
 - Unknown-conversation send → clear error (no stored reference).
 
 These tests only compile with `channel-msteams` enabled, which the default
-lanes do not do, so they run in the dedicated `test-msteams` CI lane (a
-required check via the `gate` job).
+test lane does not do, so they run in the `Test (channel Microsoft Teams)`
+entry of the `test-channel-features` matrix (a required check via the `gate`
+job).
 
 Manual validation (operator): sideload manifest, DM the bot, @mention it
 in a team channel, confirm replies and threading.

@@ -112,7 +112,7 @@ services:
       args:
         ZEROCLAW_CARGO_FLAGS: >-
           --no-default-features
-          --features acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-lark,channel-matrix,channel-msteams,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export,whatsapp-web
+          --features acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-git,channel-lark,channel-matrix,channel-msteams,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export,whatsapp-web
     ports:
       # Gateway dashboard, unchanged.
       - "${HOST_PORT:-127.0.0.1:42617}:${ZEROCLAW_GATEWAY_PORT:-42617}"
@@ -157,8 +157,13 @@ endpoint, still retries.
 Every activity POST from Teams carries a Bot Framework service JWT. The
 listener validates the RS256 signature against the issuer's published JWKS
 (fetched via OpenID discovery, cached, refreshed on key rotation), the
-audience (must equal `app_id`), the issuer, and expiry, all **before** the
-request body is parsed. Requests that fail any check are rejected with 401.
+audience (must equal `app_id`), the issuer, and the `exp` and `nbf` times
+with a five-minute clock-skew allowance, all **before** the request body is
+parsed. The body is then bound to the token: the token's signed `serviceurl`
+claim must match the activity's `serviceUrl`, and the signing key must be
+endorsed for the activity's `channelId`. Only then is the conversation
+recorded, so a forged or replayed body cannot redirect replies to another
+host. Requests that fail any check are rejected with 401.
 
 ## Message gating
 
