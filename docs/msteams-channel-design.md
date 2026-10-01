@@ -52,28 +52,47 @@ messages as a bot.
 makes runtime-installable plugins the target packaging model for optional
 channels, and [#8850](https://github.com/zeroclaw-labs/zeroclaw/issues/8850)
 owns migration sequencing and capability-gap tracking. ADR-006 permits a
-native implementation only as an explicit capability-based exception that
-names the missing host capability, the native code path depending on it,
-and the condition that permits migration. For Teams those are:
+native implementation only as an explicit exception that names the missing
+host capability or operational constraint, the native code path depending
+on it, and the condition that permits migration.
 
-- **Missing host capability**: supervised inbound HTTP ingress for a
-  plugin. The plugin channel contract in `wit/v0/channel.wit` is poll-based
-  (`poll-message`) and `wit/` defines no HTTP capability at all, so a
-  channel plugin can neither receive the Connector's activity POSTs nor
-  read the `Authorization` header the JWT check requires. ADR-006 lists
-  "inbound listener or webhook traffic can reach the plugin under
-  supervised runtime ownership" among the conditions it is still waiting
-  on, which is why that ADR remains `proposed`.
-- **Native code path that depends on it**: `MsTeamsChannel::listen()` hosts
-  the axum `/api/messages` route, and `bind_activity_to_claims()`
-  authenticates each request against the signed token before any state is
-  recorded. Azure Bot Service delivers activities by POSTing to a public
-  HTTPS endpoint, so there is no polling alternative to fall back on.
-- **Condition that permits migration**: once the host owns the HTTPS
-  ingress, can hand a plugin the request headers and body, and can keep
-  the Connector credential outside the component, this channel can move to
-  a plugin without protocol changes. `auth.rs`, `activity.rs`, and
-  `conversation.rs` already hold no axum types; only `mod.rs` does.
+Inbound ingress is no longer the gap.
+[#8862](https://github.com/zeroclaw-labs/zeroclaw/pull/8862) and
+[#8949](https://github.com/zeroclaw-labs/zeroclaw/pull/8949) added the
+`webhook-ingress` capability to `wit/v0/channel.wit`: the gateway hosts
+`/plugin/{path}` and hands `parse-webhook` the method, query, headers
+(including `Authorization`) and exact body. A Teams plugin could therefore
+verify the Bot Framework token and bind the activity to it inside the
+component. Receiving webhooks does not make a plugin equivalent to this
+channel, though. For Teams the exception is:
+
+- **Remaining operational constraints**:
+  - *Channel-addressed tool delivery.* Plugin channels are constructed
+    asynchronously, so the synchronous `build_channel_map` and
+    `register_channels_for_tools` surfaces cannot see them, and tools that
+    address a channel by name cannot target a plugin channel yet. Teams is
+    reachable from those tools as a native channel.
+  - *Supported distribution and configuration.*
+    [#8850](https://github.com/zeroclaw-labs/zeroclaw/issues/8850) still
+    tracks feeding plugins the canonical channel config, native-or-plugin
+    provider selection and active routing, publishing compatible plugin
+    packages, and shipping a supported WASM-enabled artifact.
+    [#10996](https://github.com/zeroclaw-labs/zeroclaw/issues/10996) tracks
+    seeding the channel instance configuration and egress grants during
+    plugin installation. Until those land, operators have no supported path
+    to install and configure a Teams plugin.
+- **Native code path that depends on them**: the orchestrator constructs
+  `MsTeamsChannel` in `build_channel_by_id` and
+  `collect_configured_channels` and reaches it from `deliver_announcement`,
+  `listing.rs` lists it, and `MsTeamsChannel::listen()` hosts the axum
+  `/api/messages` route, where `bind_activity_to_claims()` authenticates each
+  request against the signed token before any state is recorded.
+- **Condition that permits migration**: once channel-addressed tools can
+  target plugin channels and the #8850 and #10996 work gives operators a
+  supported install and configuration path, this channel can move to a
+  plugin without protocol changes. `auth.rs`, `activity.rs`, and
+  `conversation.rs` already hold no axum types; only `mod.rs` does. That
+  port is separate work and is not part of this change.
 
 ## 2. Decision summary
 
