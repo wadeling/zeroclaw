@@ -1133,6 +1133,42 @@ impl SharedMcpTransportConn for StdioTransport {
 // ── HTTP Transport ───────────────────────────────────────────────────────
 
 /// HTTP-based transport (POST requests).
+pub const TURN_SESSION_HEADER: &str = "X-ZeroClaw-Session";
+pub const TURN_CHANNEL_HEADER: &str = "X-ZeroClaw-Channel";
+pub const TURN_SENDER_HEADER: &str = "X-ZeroClaw-Sender";
+
+/// Identifiers of the turn this request is made for (`forward_context`).
+/// Read from the task-locals the gateway / channel turn scopes; absent outside
+/// a turn (e.g. the startup `tools/list`). Values that are not printable ASCII
+/// are dropped rather than failing the request.
+fn turn_context_headers() -> Vec<(&'static str, String)> {
+    fn usable(v: &str) -> bool {
+        !v.is_empty() && v.bytes().all(|b| (0x20..0x7f).contains(&b))
+    }
+    let mut out = Vec::new();
+    if let Ok(Some(key)) = zeroclaw_api::TOOL_LOOP_SESSION_KEY.try_with(Clone::clone)
+        && usable(&key)
+    {
+        out.push((TURN_SESSION_HEADER, key));
+    }
+    if let Ok(Some(caller)) = zeroclaw_api::TOOL_LOOP_CALLER.try_with(Clone::clone) {
+        if usable(&caller.channel) {
+            out.push((TURN_CHANNEL_HEADER, caller.channel));
+        }
+        if usable(&caller.sender) {
+            out.push((TURN_SENDER_HEADER, caller.sender));
+        }
+    }
+    out
+}
+
+fn apply_turn_context_headers(mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    for (key, value) in turn_context_headers() {
+        req = req.header(key, value);
+    }
+    req
+}
+
 pub struct HttpTransport {
     url: String,
     /// Per-server tool-call timeout, from `McpServerConfig.tool_timeout_secs`.
@@ -1145,6 +1181,7 @@ pub struct HttpTransport {
     max_response_bytes: u64,
     client: reqwest::Client,
     headers: std::collections::HashMap<String, String>,
+    forward_context: bool,
     session_id: ParkingMutex<Option<String>>,
 }
 
@@ -1179,6 +1216,7 @@ impl HttpTransport {
             max_response_bytes: resolve_max_response_bytes(config),
             client,
             headers: config.headers.clone(),
+            forward_context: config.forward_context,
             session_id: ParkingMutex::new(None),
         })
     }
@@ -1246,6 +1284,9 @@ impl SharedMcpTransportConn for HttpTransport {
         }
         for (key, value) in &self.headers {
             req = req.header(key, value);
+        }
+        if self.forward_context {
+            req = apply_turn_context_headers(req);
         }
         if !has_accept {
             req = req.header("Accept", MCP_STREAMABLE_ACCEPT);
@@ -1352,6 +1393,7 @@ pub struct SseTransport {
     max_response_bytes: u64,
     client: reqwest::Client,
     headers: std::collections::HashMap<String, String>,
+    forward_context: bool,
     require_https: bool,
     conn: Mutex<SseConnState>,
     shared: std::sync::Arc<Mutex<SseSharedState>>,
@@ -1398,6 +1440,7 @@ impl SseTransport {
             max_response_bytes: resolve_max_response_bytes(config),
             client,
             headers: config.headers.clone(),
+            forward_context: config.forward_context,
             require_https,
             conn: Mutex::new(SseConnState {
                 stream_state: SseStreamState::Unknown,
@@ -2023,6 +2066,9 @@ impl SharedMcpTransportConn for SseTransport {
         for (key, value) in &self.headers {
             req = req.header(key, value);
         }
+        if self.forward_context {
+            req = apply_turn_context_headers(req);
+        }
         if !has_accept {
             req = req.header("Accept", MCP_STREAMABLE_ACCEPT);
         }
@@ -2169,6 +2215,50 @@ pub(crate) fn create_shared_transport(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn turn_context_headers_follow_turn_task_locals() {
+        assert!(
+            turn_context_headers().is_empty(),
+            "no headers outside a turn"
+        );
+
+        let web = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some("gw_conv-1".into()), async { turn_context_headers() })
+            .await;
+        assert_eq!(web, vec![(TURN_SESSION_HEADER, "gw_conv-1".to_string())]);
+
+        let teams = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(
+                Some("msteams_a_b".into()),
+                zeroclaw_api::TOOL_LOOP_CALLER.scope(
+                    Some(zeroclaw_api::TurnCaller {
+                        channel: "msteams".into(),
+                        sender: "8d1b1d55-3c2e-4b6a-9f0a-0c5f1b7d2e44".into(),
+                    }),
+                    async { turn_context_headers() },
+                ),
+            )
+            .await;
+        assert_eq!(
+            teams,
+            vec![
+                (TURN_SESSION_HEADER, "msteams_a_b".to_string()),
+                (TURN_CHANNEL_HEADER, "msteams".to_string()),
+                (
+                    TURN_SENDER_HEADER,
+                    "8d1b1d55-3c2e-4b6a-9f0a-0c5f1b7d2e44".to_string()
+                ),
+            ]
+        );
+
+        let bad = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some("gw_\n\u{4f1a}".into()), async {
+                turn_context_headers()
+            })
+            .await;
+        assert!(bad.is_empty(), "non-ASCII / control values are dropped");
+    }
 
     struct TestTlsServer {
         url: String,

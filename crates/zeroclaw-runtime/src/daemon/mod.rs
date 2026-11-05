@@ -6535,6 +6535,7 @@ mod tests {
             pinned_resources: vec![],
             tls_ca_cert_path: None,
             max_response_bytes: None,
+            forward_context: false,
         });
         let agent_alias = "ops".to_string();
         config.mcp_bundles.insert(

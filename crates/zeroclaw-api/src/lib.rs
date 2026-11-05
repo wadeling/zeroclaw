@@ -32,6 +32,15 @@ pub mod turn_stop;
 pub mod vad;
 pub mod webhook;
 
+/// Who a channel turn is answering; see [`TOOL_LOOP_CALLER`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnCaller {
+    /// Channel name without the alias, e.g. `msteams`.
+    pub channel: String,
+    /// The channel's sender id (for Teams, the Entra object id).
+    pub sender: String,
+}
+
 tokio::task_local! {
     /// Current thread/sender ID for per-sender rate limiting.
     /// Set by the agent loop, read by SecurityPolicy.
@@ -50,6 +59,11 @@ tokio::task_local! {
     /// by that surface; read by tools that record a binding.
     pub static TOOL_LOOP_ACTIVE_CONVERSATION:
         Option<crate::conversation_binding::ActiveConversation>;
+
+    /// Channel and sender of the inbound message a channel turn answers.
+    /// Scoped beside `TOOL_LOOP_SESSION_KEY` by the channel orchestrator;
+    /// forwarded to MCP servers that opt in with `forward_context`.
+    pub static TOOL_LOOP_CALLER: Option<TurnCaller>;
 
     /// Native extended thinking parameters, set by the outer orchestration
     /// functions and read by `run_tool_call_loop` when building `ChatRequest`.

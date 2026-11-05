@@ -10558,6 +10558,13 @@ async fn process_channel_message_body(
             let tool_loop = zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(cost_tracking_context.clone(), tool_loop);
             let tool_loop = scope_session_key(Some(history_key.clone()), tool_loop);
+            let tool_loop = zeroclaw_api::TOOL_LOOP_CALLER.scope(
+                Some(zeroclaw_api::TurnCaller {
+                    channel: msg.channel.clone(),
+                    sender: msg.sender.clone(),
+                }),
+                tool_loop,
+            );
             let tool_loop = zeroclaw_api::TOOL_LOOP_ACTIVE_CONVERSATION.scope(
                 Some(zeroclaw_api::conversation_binding::ActiveConversation {
                     surface: zeroclaw_api::conversation_binding::ConversationSurface::Channel,

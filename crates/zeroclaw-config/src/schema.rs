@@ -5915,6 +5915,12 @@ pub struct McpServerConfig {
     /// plaintext URLs and downgrade redirects are rejected. Ignored by stdio.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca_cert_path: Option<String>,
+    /// Send the current turn's session key, channel and sender as
+    /// `X-ZeroClaw-Session` / `X-ZeroClaw-Channel` / `X-ZeroClaw-Sender` on
+    /// every HTTP/SSE request, so the server can act for that conversation's
+    /// user. Only enable for servers you trust with these identifiers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub forward_context: bool,
 }
 
 /// External MCP client configuration (`[mcp]` section).
