@@ -10558,6 +10558,15 @@ async fn process_channel_message_body(
             let tool_loop = zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(cost_tracking_context.clone(), tool_loop);
             let tool_loop = scope_session_key(Some(history_key.clone()), tool_loop);
+            let tool_loop = zeroclaw_api::TOOL_LOOP_TURN_CONTEXT.scope(
+                Some(zeroclaw_api::TurnGatewayContext {
+                    conversation_id: history_key.clone(),
+                    turn_id: turn_id.clone(),
+                    purpose: "chat".to_string(),
+                    channel: msg.channel.clone(),
+                }),
+                tool_loop,
+            );
             let tool_loop = zeroclaw_api::TOOL_LOOP_CALLER.scope(
                 Some(zeroclaw_api::TurnCaller {
                     channel: msg.channel.clone(),
@@ -10981,15 +10990,24 @@ async fn process_channel_message_body(
                 let user_msg = msg.content.clone();
                 let assistant_resp = history_response.clone();
                 let autosave_lease = turn_lease.clone();
+                let mem_turn_ctx = zeroclaw_api::TurnGatewayContext {
+                    conversation_id: history_key.clone(),
+                    turn_id: turn_id.clone(),
+                    purpose: "memory".to_string(),
+                    channel: msg.channel.clone(),
+                };
                 zeroclaw_spawn::spawn!(async move {
                     let _lease = autosave_lease;
-                    if let Err(e) = memory_strategy
-                        .consolidate_turn(
-                            &user_msg,
-                            &assistant_resp,
-                            model_provider.as_ref(),
-                            &model,
-                            temperature,
+                    if let Err(e) = zeroclaw_api::TOOL_LOOP_TURN_CONTEXT
+                        .scope(
+                            Some(mem_turn_ctx),
+                            memory_strategy.consolidate_turn(
+                                &user_msg,
+                                &assistant_resp,
+                                model_provider.as_ref(),
+                                &model,
+                                temperature,
+                            ),
                         )
                         .await
                     {

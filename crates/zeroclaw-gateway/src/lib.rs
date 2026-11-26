@@ -3,6 +3,7 @@
     clippy::useless_format,
     clippy::collapsible_if
 )]
+#![recursion_limit = "256"]
 
 #[cfg(feature = "a2a")]
 pub mod a2a;

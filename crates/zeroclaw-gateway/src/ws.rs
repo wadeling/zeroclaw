@@ -98,6 +98,12 @@ pub struct WsQuery {
     pub cwd: Option<String>,
     #[serde(default, alias = "workspaceDir", alias = "workspace_dir")]
     pub workspace_dir: Option<String>,
+    /// Platform turn identifier forwarded to the AI model gateway as `X-Agent-Turn-Id`.
+    #[serde(default, alias = "turnId")]
+    pub turn_id: Option<String>,
+    /// Call purpose (`chat` / `draft` / `memory` / `classify`) forwarded as `X-Agent-Purpose`.
+    #[serde(default)]
+    pub purpose: Option<String>,
 }
 
 fn extract_ws_token<'a>(headers: &'a HeaderMap, query_token: Option<&'a str>) -> Option<&'a str> {
@@ -200,6 +206,8 @@ pub async fn handle_ws_chat(
     let session_id = params.session_id;
     let session_name = params.name;
     let session_cwd = params.cwd.or(params.workspace_dir);
+    let initial_turn_id = params.turn_id;
+    let initial_purpose = params.purpose;
     ws.on_upgrade(move |socket| {
         handle_socket(
             socket,
@@ -208,6 +216,8 @@ pub async fn handle_ws_chat(
             session_id,
             session_name,
             session_cwd,
+            initial_turn_id,
+            initial_purpose,
             auth_subject,
         )
     })
@@ -475,11 +485,20 @@ async fn handle_socket(
     session_id: Option<String>,
     session_name: Option<String>,
     session_cwd: Option<String>,
+    initial_turn_id: Option<String>,
+    initial_purpose: Option<String>,
     // The transport-authenticated approval subject (paired-token hash), if the
     // connection was authenticated. Threaded to SOP approval frames so a policied
     // gate can be satisfied by an identified WS caller.
     auth_subject: Option<String>,
 ) {
+    let mut pending_turn_id = initial_turn_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let turn_purpose = initial_purpose
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "chat".to_string());
     let (mut sender, mut receiver) = socket.split();
     // An upgraded socket outlives the listener it arrived on, so a reload or
     // stop of this gateway instance has to end it here. Subscribed before any
@@ -858,6 +877,8 @@ async fn handle_socket(
                             &content,
                             &session_key,
                             &session_id,
+                            pending_turn_id.take(),
+                            &turn_purpose,
                             auth_subject.as_deref(),
                         )
                         .await;
@@ -1053,6 +1074,8 @@ async fn handle_socket(
                     &content,
                     &session_key,
                     &session_id,
+                    pending_turn_id.take(),
+                    &turn_purpose,
                     auth_subject.as_deref(),
                 )
                 .await;
@@ -1833,6 +1856,8 @@ async fn process_chat_message(
     content: &str,
     session_key: &str,
     session_id: &str,
+    client_turn_id: Option<String>,
+    purpose: &str,
     // Transport-authenticated approval subject (paired-token hash), threaded so a
     // mid-turn SOP approval frame carries the same identity as the top-level path.
     auth_subject: Option<&str>,
@@ -1895,7 +1920,9 @@ async fn process_chat_message(
     }));
 
     // Set session state to running
-    let turn_id = uuid::Uuid::new_v4().to_string();
+    let turn_id = client_turn_id
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     if let Some(ref backend) = state.session_backend {
         let _ = backend.set_session_state(session_key, "running", Some(&turn_id));
     }
@@ -1920,6 +1947,16 @@ async fn process_chat_message(
 
     let content_owned = content.to_string();
     let session_key_owned = session_key.to_string();
+    let gw_turn_ctx = zeroclaw_api::TurnGatewayContext {
+        conversation_id: session_id.to_string(),
+        turn_id: turn_id.clone(),
+        purpose: purpose.to_string(),
+        channel: if purpose == "draft" {
+            "draft".to_string()
+        } else {
+            "web".to_string()
+        },
+    };
     // The shared Agent turn boundary owns safeguard attribution and returns it
     // alongside the undecorated transcript. This transport only renders the
     // typed result as a standalone WS frame.
@@ -1934,24 +1971,28 @@ async fn process_chat_message(
             model = %turn_model,
             channel = WS_CHANNEL_KEY,
         );
-        zeroclaw_runtime::agent::loop_::scope_session_key(
-            Some(session_key_owned.clone()),
-            zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
-                turn_usage.clone(),
-                zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
-                    cost_tracking_context.clone(),
-                    agent
-                        .turn_streamed_with_steering_state(
-                            &content_owned,
-                            event_tx,
-                            Some(cancel_token.as_ref().clone()),
-                            Some(&mut steering_rx),
-                        )
-                        .instrument(span),
+        zeroclaw_api::TOOL_LOOP_TURN_CONTEXT
+            .scope(
+                Some(gw_turn_ctx),
+                zeroclaw_runtime::agent::loop_::scope_session_key(
+                    Some(session_key_owned.clone()),
+                    zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
+                        turn_usage.clone(),
+                        zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                            cost_tracking_context.clone(),
+                            agent
+                                .turn_streamed_with_steering_state(
+                                    &content_owned,
+                                    event_tx,
+                                    Some(cancel_token.as_ref().clone()),
+                                    Some(&mut steering_rx),
+                                )
+                                .instrument(span),
+                        ),
+                    ),
                 ),
-            ),
-        )
-        .await
+            )
+            .await
     });
 
     // Drive both futures concurrently: the agent turn produces events
@@ -2335,6 +2376,12 @@ async fn process_chat_message(
                     let user_msg = content.to_string();
                     let assistant_resp = outcome.response.clone();
                     let live_config = state.config.clone();
+                    let mem_turn_ctx = zeroclaw_api::TurnGatewayContext {
+                        conversation_id: session_id.to_string(),
+                        turn_id: turn_id.clone(),
+                        purpose: "memory".to_string(),
+                        channel: "web".to_string(),
+                    };
                     zeroclaw_spawn::spawn!(async move {
                         let config = live_config.read().clone();
                         let Some((model_provider, model, temperature)) =
@@ -2350,16 +2397,20 @@ async fn process_chat_message(
                             );
                             return;
                         };
-                        if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
-                            model_provider.as_ref(),
-                            &model,
-                            temperature,
-                            mem.as_ref(),
-                            &memory_config,
-                            &user_msg,
-                            &assistant_resp,
-                        )
-                        .await
+                        if let Err(e) = zeroclaw_api::TOOL_LOOP_TURN_CONTEXT
+                            .scope(
+                                Some(mem_turn_ctx),
+                                zeroclaw_memory::consolidation::consolidate_turn(
+                                    model_provider.as_ref(),
+                                    &model,
+                                    temperature,
+                                    mem.as_ref(),
+                                    &memory_config,
+                                    &user_msg,
+                                    &assistant_resp,
+                                ),
+                            )
+                            .await
                         {
                             ::zeroclaw_log::record!(
                                 DEBUG,

@@ -41,6 +41,39 @@ pub struct TurnCaller {
     pub sender: String,
 }
 
+/// Per-turn attribution forwarded as `X-Agent-*` HTTP headers to the platform
+/// AI model gateway; see [`TOOL_LOOP_TURN_CONTEXT`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnGatewayContext {
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub purpose: String,
+    pub channel: String,
+}
+
+/// Read the active [`TurnGatewayContext`], falling back to `TOOL_LOOP_SESSION_KEY`
+/// / `TOOL_LOOP_CALLER` when a caller only scoped session/caller task-locals.
+pub fn current_turn_gateway_context() -> Option<TurnGatewayContext> {
+    if let Ok(Some(ctx)) = TOOL_LOOP_TURN_CONTEXT.try_with(|c| c.clone()) {
+        return Some(ctx);
+    }
+    let session = TOOL_LOOP_SESSION_KEY
+        .try_with(|s| s.clone())
+        .ok()
+        .flatten()?;
+    let channel = TOOL_LOOP_CALLER
+        .try_with(|c| c.as_ref().map(|tc| tc.channel.clone()))
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    Some(TurnGatewayContext {
+        conversation_id: session,
+        turn_id: String::new(),
+        purpose: String::new(),
+        channel,
+    })
+}
+
 tokio::task_local! {
     /// Current thread/sender ID for per-sender rate limiting.
     /// Set by the agent loop, read by SecurityPolicy.
@@ -64,6 +97,10 @@ tokio::task_local! {
     /// Scoped beside `TOOL_LOOP_SESSION_KEY` by the channel orchestrator;
     /// forwarded to MCP servers that opt in with `forward_context`.
     pub static TOOL_LOOP_CALLER: Option<TurnCaller>;
+
+    /// Conversation, turn, purpose (`chat` / `memory` / `draft` / `classify`),
+    /// and channel metadata forwarded to the platform AI model gateway.
+    pub static TOOL_LOOP_TURN_CONTEXT: Option<TurnGatewayContext>;
 
     /// Native extended thinking parameters, set by the outer orchestration
     /// functions and read by `run_tool_call_loop` when building `ChatRequest`.
