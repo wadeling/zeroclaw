@@ -3069,20 +3069,52 @@ impl OpenAiCompatibleModelProvider {
         crate::opencode_session::session_token(&self.chat_completions_url())
     }
 
-    /// Attach the OpenCode affinity header, for request paths that build in the
+    /// Attach the OpenCode affinity header and CSPM AI model gateway turn
+    /// attribution headers (`X-Agent-*`), for request paths that build in the
     /// caller's task.
     ///
     /// Streaming paths must not use this: they build inside
     /// `zeroclaw_spawn::spawn!`, where the conversation task-local is no longer
-    /// readable. Those resolve `opencode_session_value` before the spawn.
+    /// readable. Those resolve `opencode_session_value` and
+    /// `zeroclaw_api::current_turn_gateway_context` before the spawn.
     fn apply_opencode_session_header(
         &self,
         req: reqwest::RequestBuilder,
     ) -> reqwest::RequestBuilder {
-        match self.opencode_session_value() {
+        let req = match self.opencode_session_value() {
             Some(session) => req.header(OPENCODE_SESSION_HEADER, session),
             None => req,
+        };
+        let turn_ctx = zeroclaw_api::current_turn_gateway_context();
+        Self::apply_turn_gateway_headers(req, turn_ctx.as_ref(), &self.extra_headers)
+    }
+
+    fn apply_turn_gateway_headers(
+        mut req: reqwest::RequestBuilder,
+        ctx: Option<&zeroclaw_api::TurnGatewayContext>,
+        extra_headers: &std::collections::HashMap<String, String>,
+    ) -> reqwest::RequestBuilder {
+        let Some(ctx) = ctx else {
+            return req;
+        };
+        for (name, val) in [
+            ("X-Agent-Conversation-Id", ctx.conversation_id.as_str()),
+            ("X-Agent-Turn-Id", ctx.turn_id.as_str()),
+            ("X-Agent-Purpose", ctx.purpose.as_str()),
+            ("X-Agent-Channel", ctx.channel.as_str()),
+        ] {
+            let trimmed = val.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if extra_headers.keys().any(|k| k.eq_ignore_ascii_case(name)) {
+                continue;
+            }
+            if reqwest::header::HeaderValue::from_str(trimmed).is_ok() {
+                req = req.header(name, trimmed);
+            }
         }
+        req
     }
 
     fn convert_tool_specs(
@@ -4623,6 +4655,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // tracing span but not task-locals, so the conversation scope is
         // unreadable past this point.
         let opencode_session = self.opencode_session_value();
+        let turn_gateway_ctx = zeroclaw_api::current_turn_gateway_context();
         let messages_owned: Vec<ChatMessage> = request.messages.to_vec();
         let tools_owned: Option<Vec<zeroclaw_api::tool::ToolSpec>> =
             request.tools.map(<[zeroclaw_api::tool::ToolSpec]>::to_vec);
@@ -4784,6 +4817,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 if let Some(session) = opencode_session.as_deref() {
                     req_builder = req_builder.header(OPENCODE_SESSION_HEADER, session);
                 }
+                req_builder = Self::apply_turn_gateway_headers(
+                    req_builder,
+                    turn_gateway_ctx.as_ref(),
+                    &provider.extra_headers,
+                );
 
                 let response = match req_builder.send().await {
                     Ok(r) => r,
@@ -4876,6 +4914,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // tracing span but not task-locals, so the conversation scope is
         // unreadable past this point.
         let opencode_session = self.opencode_session_value();
+        let turn_gateway_ctx = zeroclaw_api::current_turn_gateway_context();
         let system_prompt_owned: Option<String> = system_prompt.map(str::to_string);
         let message_owned = message.to_string();
         let model = model.to_string();
@@ -4995,6 +5034,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             if let Some(session) = opencode_session.as_deref() {
                 req_builder = req_builder.header(OPENCODE_SESSION_HEADER, session);
             }
+            req_builder = Self::apply_turn_gateway_headers(
+                req_builder,
+                turn_gateway_ctx.as_ref(),
+                &provider.extra_headers,
+            );
 
             // Send request
             let response = match req_builder.send().await {
@@ -5054,6 +5098,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // tracing span but not task-locals, so the conversation scope is
         // unreadable past this point.
         let opencode_session = self.opencode_session_value();
+        let turn_gateway_ctx = zeroclaw_api::current_turn_gateway_context();
         let messages_owned: Vec<ChatMessage> = messages.to_vec();
         let model = model.to_string();
         let count_tokens = options.count_tokens;
@@ -5143,6 +5188,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             if let Some(session) = opencode_session.as_deref() {
                 req_builder = req_builder.header(OPENCODE_SESSION_HEADER, session);
             }
+            req_builder = Self::apply_turn_gateway_headers(
+                req_builder,
+                turn_gateway_ctx.as_ref(),
+                &provider.extra_headers,
+            );
 
             let response = match req_builder.send().await {
                 Ok(r) => r,
@@ -16990,5 +17040,96 @@ mod tests {
             !text.contains("[Tool attachments: 1]"),
             "the declared count header must not ride the delivered text: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn turn_gateway_headers_forwarded_across_sync_and_stream_spawn() {
+        use futures_util::StreamExt as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (hdr_tx, mut hdr_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            for idx in 0..2 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = hdr_tx.send(raw);
+                if idx == 0 {
+                    let body = r#"{"id":"c1","choices":[{"index":0,"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                } else {
+                    let sse = "data: {\"id\":\"s1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        sse.len(),
+                        sse
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+
+        let provider = make_model_provider("custom", &format!("http://{addr}/v1"), Some("agw1.test.sig"));
+        let ctx = zeroclaw_api::TurnGatewayContext {
+            conversation_id: "conv-uuid-123".to_string(),
+            turn_id: "turn-uuid-456".to_string(),
+            purpose: "chat".to_string(),
+            channel: "web".to_string(),
+        };
+
+        // 1. Non-streaming path
+        zeroclaw_api::TOOL_LOOP_TURN_CONTEXT
+            .scope(Some(ctx.clone()), async {
+                let res = provider.simple_chat("hello", "default", Some(0.7)).await.unwrap();
+                assert_eq!(res, "ok");
+            })
+            .await;
+
+        let sync_raw = hdr_rx.recv().await.unwrap().to_ascii_lowercase();
+        assert!(sync_raw.contains("x-agent-conversation-id: conv-uuid-123"), "sync headers: {sync_raw}");
+        assert!(sync_raw.contains("x-agent-turn-id: turn-uuid-456"), "sync headers: {sync_raw}");
+        assert!(sync_raw.contains("x-agent-purpose: chat"), "sync headers: {sync_raw}");
+        assert!(sync_raw.contains("x-agent-channel: web"), "sync headers: {sync_raw}");
+
+        // 2. Streaming path (crosses zeroclaw_spawn::spawn! boundary)
+        let mem_ctx = zeroclaw_api::TurnGatewayContext {
+            conversation_id: "conv-uuid-123".to_string(),
+            turn_id: "turn-uuid-456".to_string(),
+            purpose: "memory".to_string(),
+            channel: "msteams".to_string(),
+        };
+        let msgs = [ChatMessage::user("hi")];
+        let mut stream = zeroclaw_api::TOOL_LOOP_TURN_CONTEXT
+            .scope(Some(mem_ctx), async {
+                provider.stream_chat(
+                    crate::traits::ChatRequest {
+                        messages: &msgs,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "default",
+                    Some(0.3),
+                    StreamOptions::new(true),
+                )
+            })
+            .await;
+        while stream.next().await.is_some() {}
+
+        let stream_raw = hdr_rx.recv().await.unwrap().to_ascii_lowercase();
+        assert!(stream_raw.contains("x-agent-conversation-id: conv-uuid-123"), "stream headers: {stream_raw}");
+        assert!(stream_raw.contains("x-agent-turn-id: turn-uuid-456"), "stream headers: {stream_raw}");
+        assert!(stream_raw.contains("x-agent-purpose: memory"), "stream headers: {stream_raw}");
+        assert!(stream_raw.contains("x-agent-channel: msteams"), "stream headers: {stream_raw}");
     }
 }
